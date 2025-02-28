@@ -68,15 +68,19 @@ class VisualSimulationEnv(gym.Env):
         self._ep_length = 50  # Max episode length
         self._steps = 0  # Current step
 
-        # Initialize state
-        self.dot_pos = [
+        # Initialize state as numpy arrays
+        # note: is always good to explicitly specify the type if you can
+        # thus we can reduce the type inference error  
+        # since the interpreter may infer the wrong type
+        self.dot_pos = np.array([
             random.randint(DOT_RADIUS, SCREEN_WIDTH-DOT_RADIUS),
             random.randint(DOT_RADIUS, SCREEN_HEIGHT-DOT_RADIUS)
-        ]
+        ], dtype=np.float32)
+        
         self.block_pos = np.array([
             random.randint(BLOCK_SIZE, SCREEN_WIDTH-BLOCK_SIZE),
             random.randint(BLOCK_SIZE, SCREEN_HEIGHT-BLOCK_SIZE)
-        ])
+        ], dtype=np.float32)
 
         # Initialize pygame
         if self.render_mode == "human":
@@ -86,7 +90,7 @@ class VisualSimulationEnv(gym.Env):
 
         #self.current_block_index = 0
         self.reward = 0
-
+        
     def _init_render(self):
         pygame.init()
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
@@ -96,14 +100,15 @@ class VisualSimulationEnv(gym.Env):
         # We need the following line to seed self.np_random
         super().reset(seed=seed)
 
-        self.dot_pos = [
+        self.dot_pos = np.array([
             random.randint(DOT_RADIUS, SCREEN_WIDTH-DOT_RADIUS),
             random.randint(DOT_RADIUS, SCREEN_HEIGHT-DOT_RADIUS)
-        ]
+        ], dtype=np.float32)
+        
         self.block_pos = np.array([
             random.randint(BLOCK_SIZE, SCREEN_WIDTH-BLOCK_SIZE),
             random.randint(BLOCK_SIZE, SCREEN_HEIGHT-BLOCK_SIZE)
-        ])
+        ], dtype=np.float32)
 
         self.reward = 0
         self._steps = 0
@@ -117,10 +122,10 @@ class VisualSimulationEnv(gym.Env):
 
         # 移动红点
         action_map = {
-            0: [0, -MOVE_SPEED],  # 上
-            1: [MOVE_SPEED, 0],   # 右
-            2: [0, MOVE_SPEED],   # 下
-            3: [-MOVE_SPEED, 0]  # 左
+            0: np.array([0, -MOVE_SPEED]),  # 上
+            1: np.array([MOVE_SPEED, 0]),   # 右
+            2: np.array([0, MOVE_SPEED]),   # 下
+            3: np.array([-MOVE_SPEED, 0])   # 左
         }
 
         self.dot_pos = np.clip(
@@ -141,6 +146,12 @@ class VisualSimulationEnv(gym.Env):
         else:
             done = False
 
+        # Check if episode is done due to step limit
+        # note: double check if you need this
+        # I saw you declare _ep_length but didn't use it
+        if self._steps >= self._ep_length:
+            done = True
+
         return self._get_obs(), reward, done, False, {}
 
     def _get_obs(self):
@@ -151,7 +162,12 @@ class VisualSimulationEnv(gym.Env):
         # 绘制蓝块
         pygame.draw.rect(
             canvas, (0, 0, 255),
-            (*self.block_pos - BLOCK_SIZE // 2, BLOCK_SIZE, BLOCK_SIZE)
+            (
+                int(self.block_pos[0] - BLOCK_SIZE // 2),
+                int(self.block_pos[1] - BLOCK_SIZE // 2),
+                BLOCK_SIZE,
+                BLOCK_SIZE
+            )
         )
 
         # 绘制红点
@@ -161,21 +177,40 @@ class VisualSimulationEnv(gym.Env):
         )
 
         # 截取观察区域（以红点为中心）
-        x_min = max(0, self.dot_pos[0] - OBS_SIZE // 2)
-        y_min = max(0, self.dot_pos[1] - OBS_SIZE // 2)
-        x_max = min(SCREEN_WIDTH, self.dot_pos[0] + OBS_SIZE // 2)
-        y_max = min(SCREEN_HEIGHT, self.dot_pos[1] + OBS_SIZE // 2)
-
-        # 处理边界情况
-        sub_surface = canvas.subsurface((x_min, y_min, x_max - x_min, y_max - y_min))
-        obs = pygame.surfarray.array3d(sub_surface)
-
-        # 填充不足区域
-        final_obs = np.zeros((OBS_SIZE, OBS_SIZE, 3), dtype=np.uint8)
-        final_obs[:obs.shape[0], :obs.shape[1]] = obs
-
-        # 转换为HWC格式并按行展平
-        return final_obs.transpose(1, 0, 2)  # 转换为HWC格式
+        x_min = max(0, int(self.dot_pos[0] - OBS_SIZE // 2))
+        y_min = max(0, int(self.dot_pos[1] - OBS_SIZE // 2))
+        
+        # calculate the width and height of the observation
+        # thus we can check if the observation is out of bounds
+        width = min(OBS_SIZE, SCREEN_WIDTH - x_min)
+        height = min(OBS_SIZE, SCREEN_HEIGHT - y_min)
+        
+        if width <= 0 or height <= 0:
+            # Handle edge case - return a black window in HWC format
+            return np.zeros((OBS_SIZE, OBS_SIZE, 3), dtype=np.uint8)
+            
+        # another edge case - ensure the dimensions are valid
+        try:
+            sub_surface = canvas.subsurface((x_min, y_min, width, height))
+            obs = pygame.surfarray.array3d(sub_surface)
+            
+            # PyGame returns in (W, H, C) format, convert to (H, W, C)
+            obs = obs.transpose(1, 0, 2)
+            
+            # 填充不足区域，确保大小为 (OBS_SIZE, OBS_SIZE, 3)
+            final_obs = np.zeros((OBS_SIZE, OBS_SIZE, 3), dtype=np.uint8)
+            final_obs[:min(height, OBS_SIZE), :min(width, OBS_SIZE)] = obs[:min(height, OBS_SIZE), :min(width, OBS_SIZE)]
+            
+            # Return in HWC format (Height, Width, Channel)
+            # VecTransposeImage will convert to CHW format for PyTorch
+            # no need to permute it here
+            return final_obs
+        
+        except ValueError as e:
+            print(f"Error creating observation: {e}")
+            print(f"Dimensions: x_min={x_min}, y_min={y_min}, width={width}, height={height}")
+            # Return an empty observation in HWC format
+            return np.zeros((OBS_SIZE, OBS_SIZE, 3), dtype=np.uint8)
 
     def render(self, mode='human'):
         if mode == 'rgb_array':
@@ -184,9 +219,24 @@ class VisualSimulationEnv(gym.Env):
             if self.screen is None:
                 pygame.init()
                 self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-            self.screen.blit(pygame.surfarray.make_surface(self._get_obs().transpose(1, 0, 2)), (0, 0))
-            pygame.display.flip()
-            self.clock.tick(30)
+                self.clock = pygame.time.Clock()
+            
+            # Get observation in HWC format
+            obs = self._get_obs()
+            
+            # For display, PyGame expects (W, H, C)
+            # so we need to convert it to (H, W, C) for rendering
+            obs_for_display = obs.transpose(1, 0, 2)
+            
+            try:
+                surf = pygame.surfarray.make_surface(obs_for_display)
+                self.screen.fill(WHITE)
+                self.screen.blit(surf, (0, 0))
+                pygame.display.flip()
+                self.clock.tick(30)
+            except Exception as e:
+                print(f"Error in render: {e}")
+                print(f"Observation shape: {obs_for_display.shape}")
 
     def close(self):
         if self.screen is not None:
@@ -198,9 +248,13 @@ class VisionExtractor(BaseFeaturesExtractor):
 
     def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 256):
         super().__init__(observation_space, features_dim)
-
+        
+        # After VecTransposeImage wrapper, images are already in [C, H, W] format
+        # So input channels are the first dimension
+        n_input_channels = observation_space.shape[0]
+        
         self.cnn = th.nn.Sequential(
-            th.nn.Conv2d(3, 32, 5, stride=2),  # 200x200 -> 98x98
+            th.nn.Conv2d(n_input_channels, 32, 5, stride=2),  # 200x200 -> 98x98
             th.nn.ReLU(),
             th.nn.Conv2d(32, 64, 3, stride=2),  # 98x98 -> 48x48
             th.nn.ReLU(),
@@ -209,8 +263,9 @@ class VisionExtractor(BaseFeaturesExtractor):
             th.nn.Flatten(),
         )
 
+        # Calculate the size of the flattened features
         with th.no_grad():
-            sample = th.as_tensor(observation_space.sample()[None]).float().permute(0, 3, 1, 2)
+            sample = th.as_tensor(observation_space.sample()[None]).float()
             n_flatten = self.cnn(sample).shape[1]
 
         self.linear = th.nn.Sequential(
@@ -220,7 +275,8 @@ class VisionExtractor(BaseFeaturesExtractor):
         )
 
     def forward(self, observations: th.Tensor) -> th.Tensor:
-        return self.linear(self.cnn(observations.permute(0, 3, 1, 2)))
+        features = self.cnn(observations)
+        return self.linear(features)
 
 
 # 创建环境管道
@@ -230,6 +286,9 @@ def make_env():
     return env
 
 env = DummyVecEnv([lambda: VisualSimulationEnv()])
+# use VecTransposeImage wrapper - it will convert from HWC to CHW format
+# note: if you want to use libraries, make sure you check what they did
+# otherwise you code may very likely to conflict with the library
 env = VecTransposeImage(env)
 
 # 配置模型参数
