@@ -179,3 +179,4 @@ Training/
 logs/
 eval_logs/
 .idea/
+.DS_Store
