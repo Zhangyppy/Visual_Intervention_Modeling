@@ -16,7 +16,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecFrameStack
 from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
+from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage, SubprocVecEnv
 from stable_baselines3.common.preprocessing import is_image_space
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from sb3_contrib import RecurrentPPO
@@ -443,9 +443,14 @@ class VisualSimulationEnv(gym.Env):
 
 
 class VisionExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Dict, features_dim: int = 256, input_channels=None):
+    def __init__(self, observation_space: gym.spaces.Dict, features_dim: int = 256, input_channels=None, resize_to=None):
         # Initialize with the visual part of the observation space
         super().__init__(observation_space, features_dim)
+
+        # Store the resize dimensions
+        self.resize_to = resize_to
+        if resize_to is not None:
+            print(f"Visual input will be resized from {SCREEN_WIDTH}x{SCREEN_HEIGHT} to {resize_to[0]}x{resize_to[1]}")
 
         # Extract shapes from the observation space
         # The format depends on whether the CustomVecTranspose was applied or not
@@ -467,14 +472,26 @@ class VisionExtractor(BaseFeaturesExtractor):
         
         print(f"Initializing CNN with {n_input_channels} input channels")
 
+        # Add a resize layer if resize_to is specified
+        if resize_to is not None:
+            if th.cuda.is_available():
+                self.resize = th.nn.Sequential(
+                    th.nn.Upsample(size=resize_to, mode='bilinear', align_corners=False)
+                )
+            else:
+                # Without CUDA, use a simpler approach
+                self.resize = lambda x: th.nn.functional.interpolate(
+                    x, size=resize_to, mode='bilinear', align_corners=False
+                )
+
         self.cnn = th.nn.Sequential(
             th.nn.Conv2d(
                 n_input_channels, 32, 8, stride=4
-            ),  # Larger kernel for full-screen input
+            ),
             th.nn.ReLU(),
             th.nn.Conv2d(32, 64, 4, stride=2),
             th.nn.ReLU(),
-            th.nn.Conv2d(64, 128, 3, stride=2),
+            th.nn.Conv2d(64, 128, 3, stride=1),
             th.nn.ReLU(),
             th.nn.Flatten(),
         )
@@ -505,8 +522,14 @@ class VisionExtractor(BaseFeaturesExtractor):
                     else:  # HWC format
                         sample = sample.permute(2, 0, 1).unsqueeze(0)  # Convert and add batch
                 
-            print(f"Sample shape: {sample.shape}")  # Should be (1, C, H, W)
-            n_flatten = self.cnn(sample).shape[1]
+            print(f"Original sample shape: {sample.shape}")  # Should be (1, C, H, W)
+            # Resize the sample if resize_to is specified
+            if self.resize_to is not None:
+                resized_sample = self.resize(sample)
+                print(f"Resized sample shape: {resized_sample.shape}")  # Should be (1, C, resize_h, resize_w)
+            else:
+                resized_sample = sample
+            n_flatten = self.cnn(resized_sample).shape[1]
             print(f"Flattened features size: {n_flatten}")
 
         # Create a network for processing position data
@@ -517,11 +540,16 @@ class VisionExtractor(BaseFeaturesExtractor):
         #     th.nn.Linear(action_history_dim, 32), th.nn.ReLU()
         # )
 
-        # Combine visual, position and action history features
+        # Final layer to combine all features
+        # self.combined = th.nn.Sequential(
+        #     th.nn.Linear(n_flatten + 64 + 32, features_dim), th.nn.ReLU()
+        # )
+
         self.combined = th.nn.Sequential(
-            th.nn.Linear(n_flatten + 64, features_dim),
-            th.nn.LayerNorm(features_dim),
-            th.nn.ReLU(),
+            # th.nn.Linear(n_flatten + 64, features_dim),
+            # th.nn.LayerNorm(features_dim),
+            # th.nn.ReLU(),
+            th.nn.Linear(n_flatten + 64, features_dim), th.nn.ReLU()
         )
 
     def forward(self, observations: dict) -> th.Tensor:
@@ -549,6 +577,10 @@ class VisionExtractor(BaseFeaturesExtractor):
         # Add batch dimension (CHW -> NCHW)
         if visual_obs.dim() == 3:
             visual_obs = visual_obs.unsqueeze(0)  # (C,H,W) -> (1,C,H,W)
+        
+        # Apply resize function if needed
+        if self.resize_to is not None:
+            visual_obs = self.resize(visual_obs)
         
         visual_features = self.cnn(visual_obs)
 
@@ -845,7 +877,9 @@ if __name__ == "__main__":
         features_extractor_kwargs=dict(
             features_dim=256,
             # Pass the correct number of input channels for the stacked frames
-            input_channels=input_channels
+            input_channels=input_channels,
+            # Downscale the visual input to this size (height, width)
+            # resize_to=(84, 84)
         ),
         # Use a larger network to process the stacked frames
         net_arch=[256, 128, 64],
@@ -859,10 +893,11 @@ if __name__ == "__main__":
         policy_kwargs=policy_kwargs,
         learning_rate=3e-4,
         n_steps=2048,
-        batch_size=64,
-        ent_coef=0.01,
+        batch_size=128,
+        ent_coef=0.001,
         tensorboard_log=os.path.join("Training", "Logs"),
         device=device,
+        target_kl=0.03,
     )
 
     # Training parameters
