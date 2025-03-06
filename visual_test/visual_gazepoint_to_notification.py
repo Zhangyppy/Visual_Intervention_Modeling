@@ -36,7 +36,7 @@ BLUE = (0, 0, 255)
 # Constants
 AGENT_RADIUS = 20
 BLOCK_SIZE = 80
-MOVE_SPEED = 20
+MAX_MOVE_SPEED = 30  # Maximum speed for continuous actions
 
 # Check if CUDA or MPS is available
 device = (
@@ -45,6 +45,7 @@ device = (
     else "mps" if th.backends.mps.is_available() else "cpu"
 )
 print(f"Using device: {device}")
+th.device(device)
 
 
 class VisualSimulationEnv(gym.Env):
@@ -55,9 +56,15 @@ class VisualSimulationEnv(gym.Env):
         self.render_mode = render_mode
 
         # --- ACTION SPACE ---
-        # We will choose from 4 discrete directions:
-        # 0 = Up, 1 = Right, 2 = Down, 3 = Left
-        self.action_space = spaces.Discrete(4)
+        # Changed from discrete to continuous action space
+        # Action is a 2D vector representing [x_direction, y_direction]
+        # Each value between -1 and 1, will be scaled by MAX_MOVE_SPEED
+        self.action_space = spaces.Box(
+            low=np.array([-1, -1], dtype=np.float32),
+            high=np.array([1, 1], dtype=np.float32),
+            shape=(2,),
+            dtype=np.float32
+        )
 
         # --- OBSERVATION SPACE ---
         # The observation is a dictionary containing both the visual observation and position information
@@ -91,7 +98,7 @@ class VisualSimulationEnv(gym.Env):
         )
 
         # --- Episode Variables ---
-        self._ep_length = 100  # Max episode length
+        self._ep_length = 150  # Max episode length
         self._steps = 0  # Current step
 
         # Initialize positions of agent and target
@@ -186,25 +193,43 @@ class VisualSimulationEnv(gym.Env):
         return distance < (AGENT_RADIUS + BLOCK_SIZE / 2)
 
     def _detect_oscillation(self, action):
-        """Detect if the agent is oscillating between actions"""
-        # handle init case
-        if self._steps < 4:
+        """
+        Detect if the agent is oscillating between actions.
+        """
+        # Skip detection during initial steps
+        if self._steps < 6:
             return False
 
-        # Check for simple back-and-forth pattern (e.g., 0-1-0-1)
-        # Require at least 4 actions in the pattern to avoid false positives
-        if (
-            len(set(self.action_history[:4])) <= 2  # At most 2 unique actions
-            and self.action_history[0] == self.action_history[2]
-            and self.action_history[1] == self.action_history[3]
-        ):
-            return True
-
-        # Check for repetitive single action (allow up to 3 of the same action - agent might need to move far)
-        if len(set(self.action_history[:3])) == 1:
-            return True
-
-        return False
+        # Store positions history if not already tracked
+        if not hasattr(self, 'position_history'):
+            self.position_history = np.zeros((6, 2), dtype=np.float32)
+        
+        # Update position history
+        self.position_history = np.roll(self.position_history, 1, axis=0)
+        self.position_history[0] = self.agent_pos
+        
+        # Compute vectors between consecutive positions
+        vectors = np.diff(self.position_history, axis=0)
+        
+        # Calculate vector magnitudes (squared for efficiency)
+        magnitudes_squared = np.sum(vectors**2, axis=1)
+        min_movement_squared = (0.05 * MAX_MOVE_SPEED) ** 2
+        
+        # Only analyze significant movements
+        significant_movements = magnitudes_squared > min_movement_squared
+        if np.sum(significant_movements[:4]) < 4:
+            return False
+            
+        # Check for oscillation patterns in the last 5 movements
+        # 1. Check for reversal of direction (dot product negative)
+        dot_products = np.sum(vectors[:-1] * vectors[1:], axis=1)
+        normalized_dots = dot_products / np.sqrt(magnitudes_squared[:-1] * magnitudes_squared[1:] + 1e-8)
+        
+        # 2. Count direction reversals (negative dot products)
+        direction_reversals = (normalized_dots < -0.6).sum()
+        
+        # Return True if we detect at least 3 direction reversals in the last 5 movements
+        return direction_reversals >= 3
 
     def step(self, action):
         # Process events to prevent pygame from becoming unresponsive
@@ -218,18 +243,30 @@ class VisualSimulationEnv(gym.Env):
 
         # Update action history
         self.action_history = np.roll(self.action_history, 1)
-        self.action_history[0] = action
+        self.action_history[0] = int(np.argmax(np.abs(action)))  # Store strongest direction for history
 
-        # Move the agent
-        action_map = {
-            0: np.array([0, -MOVE_SPEED]),  # Up
-            1: np.array([MOVE_SPEED, 0]),  # Right
-            2: np.array([0, MOVE_SPEED]),  # Down
-            3: np.array([-MOVE_SPEED, 0]),  # Left
-        }
+        # Normalize and scale the action vector
+        # Actions are in range [-1, 1], scale them by MAX_MOVE_SPEED
+        action_vector = np.array(action, dtype=np.float32)
+        vector_magnitude = np.linalg.norm(action_vector)
+        
+        # Normalize only if the magnitude is not zero to avoid division by zero
+        if vector_magnitude > 1e-6:
+            # Normalize to unit vector
+            normalized_action = action_vector / vector_magnitude
+            # Scale to max speed if exceeding unit magnitude
+            if vector_magnitude > 1.0:
+                action_vector = normalized_action
+            else:
+                action_vector = action_vector
 
+            move_vector = action_vector * MAX_MOVE_SPEED
+        else:
+            # Zero movement
+            move_vector = np.zeros(2, dtype=np.float32)
+            
         # Calculate the intended (unclipped) position
-        intended_pos = self.agent_pos + action_map[action]
+        intended_pos = self.agent_pos + move_vector
 
         # Check if the intended position would be outside the screen boundaries
         hit_boundary = (
@@ -438,8 +475,24 @@ class VisualSimulationEnv(gym.Env):
             return pygame.surfarray.array3d(self.screen).transpose(1, 0, 2)
 
     def close(self):
-        if self.screen is not None:
+        """
+        Clean up resources used by the environment.
+        """
+        # Free pygame resources
+        if hasattr(self, 'screen') and self.screen is not None:
             pygame.quit()
+        
+        # Explicitly free the observation canvas to avoid memory leaks
+        if hasattr(self, '_obs_canvas'):
+            del self._obs_canvas
+        
+        # Free any other buffers
+        if hasattr(self, '_visual_obs_buffer'):
+            del self._visual_obs_buffer
+            
+        # Clear position history if it exists
+        if hasattr(self, 'position_history'):
+            del self.position_history
 
 
 class VisionExtractor(BaseFeaturesExtractor):
@@ -893,17 +946,17 @@ if __name__ == "__main__":
         policy_kwargs=policy_kwargs,
         learning_rate=3e-4,
         n_steps=2048,
-        batch_size=128,
-        ent_coef=0.001,
+        batch_size=256,
+        ent_coef=0.005,
         tensorboard_log=os.path.join("Training", "Logs"),
         device=device,
-        target_kl=0.03,
+        target_kl=0.05,
     )
 
     # Training parameters
     total_timesteps = 1000000
     check_freq = 50000  # Save checkpoint every 50k steps
-    MODEL_TAG = "PPO_FrameStack4"
+    MODEL_TAG = "PPO_FrameStack4_Continuous"
 
     # Configure garbage collection
     gc.enable()
@@ -957,7 +1010,7 @@ if __name__ == "__main__":
     # Start training with proper checkpointing and memory management
     try:
         if hasattr(th, 'set_num_threads'):
-            num_threads = max(8, os.cpu_count())
+            num_threads = max(8, os.cpu_count() // 2)
             th.set_num_threads(num_threads)
             print(f"Setting PyTorch threads to {num_threads}")
         

@@ -73,8 +73,9 @@ def manual_evaluate(model, env, n_episodes=10):
                 
                 # Get and convert action
                 action, _ = model.predict(stacked_obs, deterministic=True)
-                if isinstance(action, np.ndarray):
-                    action = action.item()
+                # NOTE: With continuous actions (Box space with shape (2,)), 
+                # we need to keep the action as a numpy array of shape (2,)
+                # representing movement in [x, y] directions
                 
                 # Execute action
                 next_obs, reward, done, truncated, info = env.step(action)
