@@ -79,12 +79,12 @@ class VisualSimulationEnv(gym.Env):
                     shape=(2,),  # Agent's x, y position
                     dtype=np.float32,
                 ),
-                "action_history": spaces.Box(
-                    low=0,
-                    high=255,
-                    shape=(10,),
-                    dtype=np.uint8,
-                ),
+                # "action_history": spaces.Box(
+                #     low=0,
+                #     high=255,
+                #     shape=(10,),
+                #     dtype=np.uint8,
+                # ),
             }
         )
 
@@ -446,7 +446,7 @@ class VisionExtractor(BaseFeaturesExtractor):
             0
         ]  # Channels are first in CHW format
         pos_dim = observation_space["position"].shape[0]
-        action_history_dim = observation_space["action_history"].shape[0]
+        # action_history_dim = observation_space["action_history"].shape[0]
 
         self.cnn = th.nn.Sequential(
             th.nn.Conv2d(
@@ -472,13 +472,13 @@ class VisionExtractor(BaseFeaturesExtractor):
         self.pos_net = th.nn.Sequential(th.nn.Linear(pos_dim, 64), th.nn.ReLU())
 
         # Create a network for processing action history
-        self.action_history_net = th.nn.Sequential(
-            th.nn.Linear(action_history_dim, 32), th.nn.ReLU()
-        )
+        # self.action_history_net = th.nn.Sequential(
+        #     th.nn.Linear(action_history_dim, 32), th.nn.ReLU()
+        # )
 
         # Combine visual, position and action history features
         self.combined = th.nn.Sequential(
-            th.nn.Linear(n_flatten + 64 + 32, features_dim),
+            th.nn.Linear(n_flatten + 64, features_dim),
             th.nn.LayerNorm(features_dim),
             th.nn.ReLU(),
         )
@@ -502,16 +502,16 @@ class VisionExtractor(BaseFeaturesExtractor):
         pos_features = self.pos_net(pos_obs)
 
         # Process action history features
-        action_history_obs = th.as_tensor(observations["action_history"]).float()
+        # action_history_obs = th.as_tensor(observations["action_history"]).float()
 
         # Add batch dimension if needed
-        if action_history_obs.dim() == 1:
-            action_history_obs = action_history_obs.unsqueeze(0)
-        action_history_features = self.action_history_net(action_history_obs)
+        # if action_history_obs.dim() == 1:
+        #     action_history_obs = action_history_obs.unsqueeze(0)
+        # action_history_features = self.action_history_net(action_history_obs)
 
         # Combine features
         combined = th.cat(
-            [visual_features, pos_features, action_history_features], dim=1
+            [visual_features, pos_features], dim=1
         )
 
         return self.combined(combined)
@@ -533,9 +533,9 @@ class CustomVecTranspose(VecTransposeImage):
                 "position": venv.observation_space[
                     "position"
                 ],  # Keep position space as is
-                "action_history": spaces.Box(
-                    low=0, high=255, shape=(10,), dtype=np.uint8
-                ),
+                # "action_history": spaces.Box(
+                #     low=0, high=255, shape=(10,), dtype=np.uint8
+                # ),
             }
         )
 
@@ -549,20 +549,20 @@ class CustomVecTranspose(VecTransposeImage):
             # For vectorized observations (e.g., from DummyVecEnv)
             visual_obs = obs[0]["visual"]  # Shape: (H, W, C) or (1, H, W, C)
             position = obs[0]["position"]  # Shape: (2,) or (1, 2)
-            action_history = obs[0]["action_history"]  # Shape: (10,) or (1, 10)
+            # action_history = obs[0]["action_history"]  # Shape: (10,) or (1, 10)
         else:
             # For single observations (e.g., during evaluation)
             visual_obs = obs["visual"]  # Shape: (H, W, C)
             position = obs["position"]  # Shape: (2,)
-            action_history = obs["action_history"]  # Shape: (10,)
+            # action_history = obs["action_history"]  # Shape: (10,)
 
         # Remove any extra batch dimension from DummyVecEnv if present
         if len(visual_obs.shape) == 4:
             visual_obs = visual_obs[0]  # Convert (1, H, W, C) to (H, W, C)
         if len(position.shape) == 2:
             position = position[0]  # Convert (1, 2) to (2,)
-        if len(action_history.shape) == 2:
-            action_history = action_history[0]  # Convert (1, 10) to (10,)
+        # if len(action_history.shape) == 2:
+        #     action_history = action_history[0]  # Convert (1, 10) to (10,)
 
         # Convert from HWC to CHW format
         visual_obs = np.transpose(visual_obs, (2, 0, 1))  # (H, W, C) -> (C, H, W)
@@ -570,7 +570,7 @@ class CustomVecTranspose(VecTransposeImage):
         return {
             "visual": visual_obs,
             "position": position,
-            "action_history": action_history,
+            # "action_history": action_history,
         }
 
 
@@ -656,20 +656,14 @@ env = CustomVecTranspose(env)
 policy_kwargs = dict(
     features_extractor_class=VisionExtractor,
     features_extractor_kwargs=dict(features_dim=256),
-    # net_arch=[128, 64],
-    net_arch=dict(
-        pi=[128, 64],  # policy network architecture
-        vf=[128, 64],  # value network architecture
-    ),
-    lstm_hidden_size=64,
-    enable_critic_lstm=True,
+    net_arch=[128, 64]
 )
 
 # Initialize model
-# model = PPO(
-model = RecurrentPPO(
-    #    "MultiInputPolicy",
-    "MultiInputLstmPolicy",
+model = PPO(
+# model = RecurrentPPO(
+       "MultiInputPolicy",
+    # "MultiInputLstmPolicy",
     env,
     verbose=1,
     policy_kwargs=policy_kwargs,
@@ -688,7 +682,7 @@ model = RecurrentPPO(
 # Training with checkpointing
 total_timesteps = 1000000
 check_freq = 25000  # Save checkpoint every 25k steps
-MODEL_TAG = "RecurrentPPO"
+MODEL_TAG = "StandardPPO"
 
 # Check if there's a latest checkpoint to resume from
 checkpoint_dir = "Training/Checkpoints"
