@@ -10,7 +10,6 @@ import numpy as np
 import random
 import os
 import torch as th
-from torch.utils.tensorboard import SummaryWriter
 
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.monitor import Monitor
@@ -21,6 +20,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
 from stable_baselines3.common.preprocessing import is_image_space
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from sb3_contrib import RecurrentPPO
+from torch.utils.tensorboard import SummaryWriter
 
 # Pygame settings
 pygame.init()
@@ -934,7 +934,7 @@ if __name__ == "__main__":
             total_timesteps=remaining_timesteps,
             progress_bar=True,
             callback=callback_list,
-            log_interval=100,
+            tb_log_name=MODEL_TAG
         )
     except KeyboardInterrupt:
         print("\nTraining interrupted. Saving final checkpoint...")
