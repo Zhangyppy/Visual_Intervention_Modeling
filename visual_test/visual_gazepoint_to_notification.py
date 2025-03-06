@@ -63,6 +63,8 @@ class VisualSimulationEnv(gym.Env):
         # The observation is a dictionary containing both the visual observation and position information
         self.observation_space = spaces.Dict(
             {
+                # NOTE: We initialize with HWC format, which will be converted to CHW
+                # by the CustomVecTranspose wrapper
                 "visual": spaces.Box(
                     low=0,
                     high=255,
@@ -226,9 +228,6 @@ class VisualSimulationEnv(gym.Env):
             3: np.array([-MOVE_SPEED, 0]),  # Left
         }
 
-        # Store the previous position
-        prev_pos = self.agent_pos.copy()
-
         # Calculate the intended (unclipped) position
         intended_pos = self.agent_pos + action_map[action]
 
@@ -283,7 +282,7 @@ class VisualSimulationEnv(gym.Env):
         if self._steps >= self._ep_length:
             done = True
 
-        # Store the reward and update action history
+        # Store the reward for rendering purposes
         self.reward += reward
 
         return self._get_obs(), reward, done, False, {}
@@ -437,16 +436,29 @@ class VisualSimulationEnv(gym.Env):
 
 
 class VisionExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Dict, features_dim: int = 256):
+    def __init__(self, observation_space: gym.spaces.Dict, features_dim: int = 256, input_channels=None):
         # Initialize with the visual part of the observation space
         super().__init__(observation_space, features_dim)
 
         # Extract shapes from the observation space
-        n_input_channels = observation_space["visual"].shape[
-            0
-        ]  # Channels are first in CHW format
+        # The format depends on whether the CustomVecTranspose was applied or not
+        visual_space = observation_space["visual"]
+        
+        # If input_channels is specified, use it (for frame stacking)
+        if input_channels is not None:
+            n_input_channels = input_channels
+            print(f"Using provided input channels: {n_input_channels}")
+        else:
+            # Determine the correct channel dimension
+            if len(visual_space.shape) == 3:  # (C, H, W) format after CustomVecTranspose
+                n_input_channels = visual_space.shape[0]
+            else:  # (H, W, C) format before CustomVecTranspose
+                n_input_channels = visual_space.shape[2]
+            
         pos_dim = observation_space["position"].shape[0]
         # action_history_dim = observation_space["action_history"].shape[0]
+        
+        print(f"Initializing CNN with {n_input_channels} input channels")
 
         self.cnn = th.nn.Sequential(
             th.nn.Conv2d(
@@ -462,11 +474,33 @@ class VisionExtractor(BaseFeaturesExtractor):
 
         # Calculate the size of the flattened features
         with th.no_grad():
-            # Process a sample visual observation (already in CHW format)
-            sample = th.as_tensor(observation_space["visual"].sample()[None]).float()
-            # print(f"Sample shape: {sample.shape}")  # Should be (1, C, H, W)
+            # Process a sample visual observation
+            if input_channels is not None:
+                # Create a dummy sample with the correct number of channels
+                # NOTE: use all zeros as sample because the observation space might not reflect the the stacked frames during initialization
+                # Shape: (1, input_channels, height, width)
+                if len(visual_space.shape) == 3:  # CHW format
+                    height, width = visual_space.shape[1], visual_space.shape[2]
+                else:  # HWC format
+                    height, width = visual_space.shape[0], visual_space.shape[1]
+                
+                # Create a correctly shaped tensor filled with zeros
+                sample = th.zeros((1, input_channels, height, width), dtype=th.float32)
+                print(f"Created dummy sample with shape: {sample.shape}")
+            else:
+                # Standard case - use the observation space's sample method
+                sample = th.as_tensor(visual_space.sample(), dtype=th.float32)
+                
+                # Convert to NCHW format if needed
+                if len(sample.shape) == 3:
+                    if sample.shape[0] <= 3:  # Already CHW format
+                        sample = sample.unsqueeze(0)  # Add batch dimension
+                    else:  # HWC format
+                        sample = sample.permute(2, 0, 1).unsqueeze(0)  # Convert and add batch
+                
+            print(f"Sample shape: {sample.shape}")  # Should be (1, C, H, W)
             n_flatten = self.cnn(sample).shape[1]
-            # print(f"Flattened features size: {n_flatten}")
+            print(f"Flattened features size: {n_flatten}")
 
         # Create a network for processing position data
         self.pos_net = th.nn.Sequential(th.nn.Linear(pos_dim, 64), th.nn.ReLU())
@@ -485,20 +519,32 @@ class VisionExtractor(BaseFeaturesExtractor):
 
     def forward(self, observations: dict) -> th.Tensor:
         # Process visual features (already in CHW format from CustomVecTranspose)
-        visual_obs = th.as_tensor(observations["visual"]).float()
-
+        # Note: we only convert to tensor once if not already a tensor
+        if isinstance(observations["visual"], th.Tensor):
+            visual_obs = observations["visual"]
+            if visual_obs.dtype != th.float32:
+                visual_obs = visual_obs.float()
+        else:
+            visual_obs = th.as_tensor(observations["visual"], dtype=th.float32)
+        
         # Add batch dimension (CHW -> NCHW)
         if visual_obs.dim() == 3:
             visual_obs = visual_obs.unsqueeze(0)  # (C,H,W) -> (1,C,H,W)
-
+        
         visual_features = self.cnn(visual_obs)
 
         # Process position features
-        pos_obs = th.as_tensor(observations["position"]).float()
-
+        if isinstance(observations["position"], th.Tensor):
+            pos_obs = observations["position"]
+            if pos_obs.dtype != th.float32:
+                pos_obs = pos_obs.float()
+        else:
+            pos_obs = th.as_tensor(observations["position"], dtype=th.float32)
+            
         # Add batch dimension if needed
         if pos_obs.dim() == 1:
             pos_obs = pos_obs.unsqueeze(0)  # (2,) -> (1,2)
+            
         pos_features = self.pos_net(pos_obs)
 
         # Process action history features
@@ -510,16 +556,25 @@ class VisionExtractor(BaseFeaturesExtractor):
         # action_history_features = self.action_history_net(action_history_obs)
 
         # Combine features
-        combined = th.cat(
-            [visual_features, pos_features], dim=1
-        )
-
+        combined = th.cat([visual_features, pos_features], dim=1)
+        
         return self.combined(combined)
 
 
 class CustomVecTranspose(VecTransposeImage):
     def __init__(self, venv):
         super().__init__(venv)
+        
+        # Get the number of stacked frames from the VecFrameStack wrapper
+        # Default to 1 if not frame stacked
+        self.n_stack = getattr(venv, "n_stack", 1)
+        
+        # Get the number of channels from the original visual observation space
+        # This is the number of channels AFTER stacking (e.g., 12 for 4 stacks of RGB)
+        orig_visual_shape = venv.observation_space["visual"].shape
+        n_channels = orig_visual_shape[-1]  # Last dimension is channels in HWC format
+        
+        print(f"Original visual shape: {orig_visual_shape}, detected {n_channels} channels")
 
         # Update observation space to handle dictionary
         self.observation_space = spaces.Dict(
@@ -527,15 +582,12 @@ class CustomVecTranspose(VecTransposeImage):
                 "visual": spaces.Box(
                     low=0,
                     high=255,
-                    shape=(3, SCREEN_HEIGHT, SCREEN_WIDTH),  # CHW format
+                    shape=(n_channels, SCREEN_HEIGHT, SCREEN_WIDTH),  # CHW format with stacked frames
                     dtype=np.uint8,
                 ),
                 "position": venv.observation_space[
                     "position"
                 ],  # Keep position space as is
-                # "action_history": spaces.Box(
-                #     low=0, high=255, shape=(10,), dtype=np.uint8
-                # ),
             }
         )
 
@@ -544,28 +596,31 @@ class CustomVecTranspose(VecTransposeImage):
         Transpose observations from the vectorized environment.
         DummyVecEnv wraps observations in a list/array, so we need to handle that.
         """
-        # Handle vectorized observations
-        if isinstance(obs, (list, np.ndarray)):
-            # For vectorized observations (e.g., from DummyVecEnv)
-            visual_obs = obs[0]["visual"]  # Shape: (H, W, C) or (1, H, W, C)
-            position = obs[0]["position"]  # Shape: (2,) or (1, 2)
-            # action_history = obs[0]["action_history"]  # Shape: (10,) or (1, 10)
-        else:
+        # Fast path for common case to avoid redundant operations
+        if isinstance(obs, dict):
             # For single observations (e.g., during evaluation)
             visual_obs = obs["visual"]  # Shape: (H, W, C)
             position = obs["position"]  # Shape: (2,)
-            # action_history = obs["action_history"]  # Shape: (10,)
+        else:
+            # For vectorized observations (e.g., from DummyVecEnv)
+            # This is the most common case during training
+            visual_obs = obs[0]["visual"]  # Shape: (H, W, C) or (1, H, W, C)
+            position = obs[0]["position"]  # Shape: (2,) or (1, 2)
+            # action_history = obs[0]["action_history"]  # Shape: (10,) or (1, 10)
 
+        # Single fast check for both visual and position to remove batch dim
         # Remove any extra batch dimension from DummyVecEnv if present
-        if len(visual_obs.shape) == 4:
+        if isinstance(visual_obs, np.ndarray) and len(visual_obs.shape) == 4:
             visual_obs = visual_obs[0]  # Convert (1, H, W, C) to (H, W, C)
-        if len(position.shape) == 2:
+        
+        if isinstance(position, np.ndarray) and len(position.shape) == 2:
             position = position[0]  # Convert (1, 2) to (2,)
-        # if len(action_history.shape) == 2:
-        #     action_history = action_history[0]  # Convert (1, 10) to (10,)
 
-        # Convert from HWC to CHW format
-        visual_obs = np.transpose(visual_obs, (2, 0, 1))  # (H, W, C) -> (C, H, W)
+        # Convert from HWC to CHW format - only once and only if needed
+        # Check if already in CHW format to avoid unnecessary transpose
+        if isinstance(visual_obs, np.ndarray) and len(visual_obs.shape) == 3 and visual_obs.shape[2] <= 12:
+            # Standard case - needs transpose
+            visual_obs = np.transpose(visual_obs, (2, 0, 1))  # (H, W, C) -> (C, H, W)
 
         return {
             "visual": visual_obs,
@@ -648,21 +703,54 @@ def make_env():
     return env
 
 
-env = DummyVecEnv([make_env])
-# Use custom wrapper for dictionary observation space
-env = CustomVecTranspose(env)
+# Custom helper for creating an environment with proper frame stacking
+def create_env_with_frame_stacking(n_stack=4):
+    """
+    Create an environment with frame stacking properly configured for 
+    dictionary observations and CHW format.
+    
+    Args:
+        n_stack: Number of frames to stack
+        
+    Returns:
+        A properly configured environment with frame stacking
+    """
+    # Create base environment
+    env = DummyVecEnv([make_env])
+    print(f"Original observation space: {env.observation_space}")
+    
+    # Apply frame stacking
+    env = VecFrameStack(env, n_stack=n_stack)
+    print(f"After VecFrameStack: {env.observation_space}")
+    
+    # Apply custom transpose
+    env = CustomVecTranspose(env)
+    print(f"After CustomVecTranspose: {env.observation_space}")
+    
+    return env, 3 * n_stack  # Return env and number of input channels
+
+
+# Create environment with frame stacking
+n_stack = 4  # Stack 4 frames
+env, input_channels = create_env_with_frame_stacking(n_stack=n_stack)
 
 # Configure model parameters
 policy_kwargs = dict(
     features_extractor_class=VisionExtractor,
-    features_extractor_kwargs=dict(features_dim=256),
-    net_arch=[128, 64]
+    features_extractor_kwargs=dict(
+        features_dim=256,
+        # Pass the correct number of input channels for the stacked frames
+        input_channels=input_channels
+    ),
+    # Use a larger network to process the stacked frames
+    # TODO: we may adjust this further to improve performance
+    net_arch=[256, 128, 64],
 )
 
 # Initialize model
 model = PPO(
-# model = RecurrentPPO(
-       "MultiInputPolicy",
+    # model = RecurrentPPO(
+    "MultiInputPolicy",
     # "MultiInputLstmPolicy",
     env,
     verbose=1,
@@ -682,7 +770,7 @@ model = PPO(
 # Training with checkpointing
 total_timesteps = 1000000
 check_freq = 25000  # Save checkpoint every 25k steps
-MODEL_TAG = "StandardPPO"
+MODEL_TAG = "PPO_FrameStack4"
 
 # Check if there's a latest checkpoint to resume from
 checkpoint_dir = "Training/Checkpoints"
@@ -704,8 +792,8 @@ if os.path.exists(checkpoint_dir):
 # Load the latest checkpoint if it exists
 if latest_checkpoint:
     print("Loading latest checkpoint...")
-    # model = PPO.load(latest_checkpoint, env=env)
-    model = RecurrentPPO.load(latest_checkpoint, env=env)
+    model = PPO.load(latest_checkpoint, env=env)
+    # model = RecurrentPPO.load(latest_checkpoint, env=env)
     # Extract the timestep from the checkpoint name, considering the '_steps.zip' suffix
     start_timestep = int(latest_checkpoint.split("_")[-2])
     remaining_timesteps = total_timesteps - start_timestep
