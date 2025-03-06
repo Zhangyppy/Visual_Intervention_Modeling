@@ -1,5 +1,5 @@
-# import gym
-# from gym import Env
+import datetime
+import gc
 from gymnasium import spaces
 import gymnasium as gym
 import numpy as np
@@ -19,7 +19,7 @@ from stable_baselines3.common.vec_env import VecFrameStack
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
 from stable_baselines3.common.preprocessing import is_image_space
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from sb3_contrib import RecurrentPPO
 
 # Pygame settings
@@ -288,8 +288,12 @@ class VisualSimulationEnv(gym.Env):
         return self._get_obs(), reward, done, False, {}
 
     def _get_obs(self):
-        # Create a canvas for the full screen observation
-        canvas = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+        # Create a canvas for the full screen observation or reuse existing one
+        if not hasattr(self, '_obs_canvas'):
+            self._obs_canvas = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+        
+        # Reuse canvas to avoid memory allocation each time
+        canvas = self._obs_canvas
         canvas.fill(WHITE)
 
         # Draw the blue target block
@@ -304,14 +308,17 @@ class VisualSimulationEnv(gym.Env):
         # draw the space boundaries outer boundary
         pygame.draw.rect(canvas, BLACK, (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT), 5)
 
-        # Convert the canvas to a numpy array
-        visual_obs = pygame.surfarray.array3d(canvas)
+        # Convert the canvas to a numpy array - reuse buffer if possible
+        if not hasattr(self, '_visual_obs_buffer') or self._visual_obs_buffer.shape != (SCREEN_HEIGHT, SCREEN_WIDTH, 3):
+            self._visual_obs_buffer = np.empty((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8)
+        
+        # Get pixel data into our buffer - more efficient than creating new array
         # PyGame returns in (W, H, C) format, convert to (H, W, C)
-        visual_obs = visual_obs.transpose(1, 0, 2)
-
+        pygame.pixelcopy.surface_to_array(np.transpose(self._visual_obs_buffer, (1, 0, 2)), canvas)
+        
         # Return both visual observation and position information
         return {
-            "visual": visual_obs,
+            "visual": self._visual_obs_buffer,
             "position": self.agent_pos.astype(np.float32),
             "action_history": self.action_history,
         }
@@ -523,9 +530,21 @@ class VisionExtractor(BaseFeaturesExtractor):
         if isinstance(observations["visual"], th.Tensor):
             visual_obs = observations["visual"]
             if visual_obs.dtype != th.float32:
-                visual_obs = visual_obs.float()
+                # Convert in place if possible
+                visual_obs = visual_obs.to(dtype=th.float32, non_blocking=True)
         else:
-            visual_obs = th.as_tensor(observations["visual"], dtype=th.float32)
+            # Pin memory if using CUDA for faster host-to-device transfer
+            if th.cuda.is_available():
+                # Reuse buffer if possible to reduce memory allocations
+                if not hasattr(self, '_visual_tensor_buffer') or self._visual_tensor_buffer.shape[1:] != observations["visual"].shape:
+                    shape = observations["visual"].shape
+                    self._visual_tensor_buffer = th.empty((1,) + shape if len(shape) == 3 else shape, dtype=th.float32, device="cuda")
+                
+                # Copy directly into the buffer
+                visual_obs = self._visual_tensor_buffer
+                visual_obs.copy_(th.as_tensor(observations["visual"], dtype=th.float32, device="cuda"), non_blocking=True)
+            else:
+                visual_obs = th.as_tensor(observations["visual"], dtype=th.float32)
         
         # Add batch dimension (CHW -> NCHW)
         if visual_obs.dim() == 3:
@@ -537,9 +556,14 @@ class VisionExtractor(BaseFeaturesExtractor):
         if isinstance(observations["position"], th.Tensor):
             pos_obs = observations["position"]
             if pos_obs.dtype != th.float32:
-                pos_obs = pos_obs.float()
+                # Convert in place if possible
+                pos_obs = pos_obs.to(dtype=th.float32, non_blocking=True)
         else:
-            pos_obs = th.as_tensor(observations["position"], dtype=th.float32)
+            # Use cuda if available for consistency with visual features
+            if th.cuda.is_available():
+                pos_obs = th.as_tensor(observations["position"], dtype=th.float32, device="cuda")
+            else:
+                pos_obs = th.as_tensor(observations["position"], dtype=th.float32)
             
         # Add batch dimension if needed
         if pos_obs.dim() == 1:
@@ -556,9 +580,9 @@ class VisionExtractor(BaseFeaturesExtractor):
         # action_history_features = self.action_history_net(action_history_obs)
 
         # Combine features
-        combined = th.cat([visual_features, pos_features], dim=1)
+        # combined = th.cat([visual_features, pos_features], dim=1)
         
-        return self.combined(combined)
+        return self.combined(th.cat([visual_features, pos_features], dim=1))
 
 
 class CustomVecTranspose(VecTransposeImage):
@@ -588,6 +612,9 @@ class CustomVecTranspose(VecTransposeImage):
                 "position": venv.observation_space[
                     "position"
                 ],  # Keep position space as is
+                # "action_history": spaces.Box(
+                #     low=0, high=255, shape=(10,), dtype=np.uint8
+                # ),
             }
         )
 
@@ -620,10 +647,27 @@ class CustomVecTranspose(VecTransposeImage):
         # Check if already in CHW format to avoid unnecessary transpose
         if isinstance(visual_obs, np.ndarray) and len(visual_obs.shape) == 3 and visual_obs.shape[2] <= 12:
             # Standard case - needs transpose
-            visual_obs = np.transpose(visual_obs, (2, 0, 1))  # (H, W, C) -> (C, H, W)
 
+            h, w, c = visual_obs.shape
+            
+            # Create or resize transpose buffer if needed
+            if not hasattr(self, '_transpose_buffer') or self._transpose_buffer.shape != (c, h, w):
+                # First usage or shape changed, create new buffer with exact shape needed
+                self._transpose_buffer = np.empty((c, h, w), dtype=visual_obs.dtype)
+            
+            # Manual optimized transpose to reuse existing buffer (no new allocation)
+            # it should faster than np.transpose which would create a new array
+            for i in range(c):
+                # Direct slice assignment is more efficient than np.copyto
+                self._transpose_buffer[i] = visual_obs[:, :, i]
+            
+            visual_result = self._transpose_buffer
+        else:
+            # Already in the right format or special case, no need to transpose
+            visual_result = visual_obs
+            
         return {
-            "visual": visual_obs,
+            "visual": visual_result,
             "position": position,
             # "action_history": action_history,
         }
@@ -703,7 +747,7 @@ def make_env():
     return env
 
 
-# Custom helper for creating an environment with proper frame stacking
+# Helper for creating an environment with proper frame stacking
 def create_env_with_frame_stacking(n_stack=4):
     """
     Create an environment with frame stacking properly configured for 
@@ -730,109 +774,188 @@ def create_env_with_frame_stacking(n_stack=4):
     return env, 3 * n_stack  # Return env and number of input channels
 
 
-# Create environment with frame stacking
-n_stack = 4  # Stack 4 frames
-env, input_channels = create_env_with_frame_stacking(n_stack=n_stack)
+# Helper for creating an evaluation environment with rendering support
+def create_eval_env_with_frame_stacking(n_stack=4, render_mode="human", debug=False):
+    """
+    Create an evaluation environment with frame stacking and rendering support.
+    
+    Args:
+        n_stack: Number of frames to stack (must match training)
+        render_mode: The rendering mode to use (e.g., "human")
+        debug: Whether to enable debug output for observations
+        
+    Returns:
+        A properly configured environment for evaluation
+    """
+    # Create a function that returns a properly configured env with render mode
+    def make_env_with_render():
+        env = VisualSimulationEnv(render_mode=render_mode)
+        env = Monitor(env)
 
-# Configure model parameters
-policy_kwargs = dict(
-    features_extractor_class=VisionExtractor,
-    features_extractor_kwargs=dict(
-        features_dim=256,
-        # Pass the correct number of input channels for the stacked frames
-        input_channels=input_channels
-    ),
-    # Use a larger network to process the stacked frames
-    # TODO: we may adjust this further to improve performance
-    net_arch=[256, 128, 64],
-)
+        return env
+    
+    # Create vectorized environment
+    env = DummyVecEnv([make_env_with_render])
+    print(f"Eval env - original observation space: {env.observation_space}")
+    
+    # Apply frame stacking - same as in training
+    env = VecFrameStack(env, n_stack=n_stack)
+    print(f"Eval env - after VecFrameStack: {env.observation_space}")
+    
+    # Apply custom transpose - same as in training
+    env = CustomVecTranspose(env)
+    print(f"Eval env - after CustomVecTranspose: {env.observation_space}")
+    
+    return env
 
-# Initialize model
-model = PPO(
-    # model = RecurrentPPO(
-    "MultiInputPolicy",
-    # "MultiInputLstmPolicy",
-    env,
-    verbose=1,
-    policy_kwargs=policy_kwargs,
-    learning_rate=3e-4,
-    # n_steps=2048,
-    # batch_size=64,
-    n_steps=4096,
-    batch_size=128,
-    ent_coef=0.01,
-    tensorboard_log=os.path.join("Training", "Logs"),
-    device=device,
-)
 
-# ==== Training ====
+# Custom callback to manage memory during training
+class MemoryManagementCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        
+    def _on_step(self) -> bool:
+        # Run garbage collection when memory is low or every 50K steps
+        import psutil
+        memory_percent = psutil.virtual_memory().percent
+        if memory_percent > 95 or self.num_timesteps % 50000 == 0:
+            gc.collect()
+            if th.cuda.is_available():
+                # Clear CUDA cache if using GPU
+                th.cuda.empty_cache()
+            
+            # Log memory usage if verbose
+            if self.verbose > 0:
+                import psutil
+                memory_usage = psutil.Process().memory_info().rss / (1024 * 1024)
+                print(f"Step {self.num_timesteps}: Memory usage: {memory_usage:.2f} MB")
+        
+        return True
 
-# Training with checkpointing
-total_timesteps = 1000000
-check_freq = 25000  # Save checkpoint every 25k steps
-MODEL_TAG = "PPO_FrameStack4"
 
-# Check if there's a latest checkpoint to resume from
-checkpoint_dir = "Training/Checkpoints"
-latest_checkpoint = None
-if os.path.exists(checkpoint_dir):
-    checkpoints = [
-        f
-        for f in os.listdir(checkpoint_dir)
-        if f.startswith(f"ppo_visual_attention_checkpoint_{MODEL_TAG}_")
-    ]
-    if checkpoints:
-        print(f"Found {len(checkpoints)} checkpoints")
-        print(f"Checkpoints: {checkpoints}")
-        # Extract the timestep from filenames that end with '_NUMBER_steps.zip'
-        latest_checkpoint = max(checkpoints, key=lambda x: int(x.split("_")[-2]))
-        latest_checkpoint = os.path.join(checkpoint_dir, latest_checkpoint)
-        print(f"Found latest checkpoint: {latest_checkpoint}")
+# Only run training code when script is executed directly (not imported)
+if __name__ == "__main__":
+    # Create environment with frame stacking
+    n_stack = 4  # Stack 4 frames
+    env, input_channels = create_env_with_frame_stacking(n_stack=n_stack)
 
-# Load the latest checkpoint if it exists
-if latest_checkpoint:
-    print("Loading latest checkpoint...")
-    model = PPO.load(latest_checkpoint, env=env)
-    # model = RecurrentPPO.load(latest_checkpoint, env=env)
-    # Extract the timestep from the checkpoint name, considering the '_steps.zip' suffix
-    start_timestep = int(latest_checkpoint.split("_")[-2])
-    remaining_timesteps = total_timesteps - start_timestep
-    print(f"Resuming training from timestep {start_timestep}")
-else:
-    start_timestep = 0
-    remaining_timesteps = total_timesteps
-
-# Create the checkpoint callback
-checkpoint_callback = CheckpointCallback(
-    save_freq=check_freq,
-    save_path=checkpoint_dir,
-    name_prefix=f"ppo_visual_attention_checkpoint_{MODEL_TAG}",
-    save_replay_buffer=False,
-    save_vecnormalize=True,
-    verbose=1,
-)
-
-# Start training with proper checkpointing
-try:
-    model.learn(
-        total_timesteps=remaining_timesteps,
-        progress_bar=True,
-        callback=checkpoint_callback,
+    # Configure model parameters
+    policy_kwargs = dict(
+        features_extractor_class=VisionExtractor,
+        features_extractor_kwargs=dict(
+            features_dim=256,
+            # Pass the correct number of input channels for the stacked frames
+            input_channels=input_channels
+        ),
+        # Use a larger network to process the stacked frames
+        net_arch=[256, 128, 64],
     )
-except KeyboardInterrupt:
-    print("\nTraining interrupted. Saving final checkpoint...")
-    save_checkpoint(model, start_timestep + model.num_timesteps, model_tag=MODEL_TAG)
-    print("Checkpoint saved. You can resume training later.")
 
-# Save final model
-model.save("ppo_visual_attention_full")
+    # Initialize model
+    model = PPO(
+        "MultiInputPolicy",
+        env,
+        verbose=1,
+        policy_kwargs=policy_kwargs,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=64,
+        ent_coef=0.01,
+        tensorboard_log=os.path.join("Training", "Logs"),
+        device=device,
+    )
 
+    # Training parameters
+    total_timesteps = 1000000
+    check_freq = 50000  # Save checkpoint every 50k steps
+    MODEL_TAG = "PPO_FrameStack4"
 
-# To continue training after the initial run completes, uncomment and run:
-# continue_training("ppo_visual_attention_full", additional_timesteps=200000)
+    # Configure garbage collection
+    gc.enable()
 
-# For testing/evaluation
-env = VisualSimulationEnv(render_mode="human")
-env = Monitor(env)
-mean_reward, _ = evaluate_policy(model, env, n_eval_episodes=10, render=True)
-print(f"Mean reward: {mean_reward:.2f}")
+    # Check if there's a latest checkpoint to resume from
+    checkpoint_dir = "Training/Checkpoints"
+    latest_checkpoint = None
+    if os.path.exists(checkpoint_dir):
+        checkpoints = [
+            f
+            for f in os.listdir(checkpoint_dir)
+            if f.startswith(f"ppo_visual_attention_checkpoint_{MODEL_TAG}_")
+        ]
+        if checkpoints:
+            print(f"Found {len(checkpoints)} checkpoints")
+            print(f"Checkpoints: {checkpoints}")
+            # Extract the timestep from filenames that end with '_NUMBER_steps.zip'
+            latest_checkpoint = max(checkpoints, key=lambda x: int(x.split("_")[-2]))
+            latest_checkpoint = os.path.join(checkpoint_dir, latest_checkpoint)
+            print(f"Found latest checkpoint: {latest_checkpoint}")
+
+    # Load the latest checkpoint if it exists
+    if latest_checkpoint:
+        print("Loading latest checkpoint...")
+        model = PPO.load(latest_checkpoint, env=env)
+        # Extract the timestep from the checkpoint name
+        start_timestep = int(latest_checkpoint.split("_")[-2])
+        remaining_timesteps = total_timesteps - start_timestep
+        print(f"Resuming training from timestep {start_timestep}")
+    else:
+        start_timestep = 0
+        remaining_timesteps = total_timesteps
+
+    # Create the checkpoint callback
+    checkpoint_callback = CheckpointCallback(
+        save_freq=check_freq,
+        save_path=checkpoint_dir,
+        name_prefix=f"ppo_visual_attention_checkpoint_{MODEL_TAG}",
+        save_replay_buffer=False,
+        save_vecnormalize=True,
+        verbose=1,
+    )
+
+    # Create memory management callback
+    memory_callback = MemoryManagementCallback(verbose=1)
+
+    # Create callback list to combine multiple callbacks
+    from stable_baselines3.common.callbacks import CallbackList
+    callback_list = CallbackList([checkpoint_callback, memory_callback])
+
+    # Start training with proper checkpointing and memory management
+    try:
+        if hasattr(th, 'set_num_threads'):
+            num_threads = max(8, os.cpu_count())
+            th.set_num_threads(num_threads)
+            print(f"Setting PyTorch threads to {num_threads}")
+        
+        # Configure PyTorch to release memory more aggressively
+        if hasattr(th.cuda, 'empty_cache'):
+            th.cuda.empty_cache()
+        
+        model.learn(
+            total_timesteps=remaining_timesteps,
+            progress_bar=True,
+            callback=callback_list,
+            log_interval=100,
+        )
+    except KeyboardInterrupt:
+        print("\nTraining interrupted. Saving final checkpoint...")
+        # Run garbage collection before saving to reduce memory footprint
+        gc.collect()
+        if th.cuda.is_available():
+            th.cuda.empty_cache()
+        
+        save_checkpoint(model, start_timestep + model.num_timesteps, model_tag=MODEL_TAG)
+        print("Checkpoint saved. You can resume training later.")
+
+    # Clean up memory before saving final model
+    gc.collect()
+    if th.cuda.is_available():
+        th.cuda.empty_cache()
+
+    # Save the final model
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    model.save(f"ppo_visual_attention_full_{timestamp}")
+    print(f"Final model saved as ppo_visual_attention_full_{timestamp}")
+    print("Model training complete!")
+    print("To properly evaluate the model with human rendering, use:")
+    print(f"python evaluate_model.py ppo_visual_attention_full_{timestamp}")
+    print("This will handle the observation stacking and preprocessing correctly for visual rendering.")
