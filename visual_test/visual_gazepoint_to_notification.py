@@ -39,12 +39,12 @@ RED = (255, 0, 0)
 BLUE = (0, 0, 255)
 
 # Constants
-AGENT_RADIUS = 10
+AGENT_RADIUS = 5
 BLOCK_SIZE = 40
-MAX_MOVE_SPEED = 30  # Maximum speed for continuous actions
-MIN_MOVE_SPEED = 15  # Minimum speed for movement when action is non-zero
+MAX_MOVE_SPEED = 20  # Maximum speed for continuous actions
+MIN_MOVE_SPEED = 5  # Minimum speed for movement when action is non-zero
 MIN_BLOCK_GENERATION_DISTANCE = (
-    60  # Minimum distance between agent and target to generate a block
+    50  # Minimum distance between agent and target to generate a block
 )
 
 # Check if CUDA or MPS is available
@@ -454,35 +454,37 @@ class VisualSimulationEnv(gym.Env):
             if self.reward_count >= 3:
                 done = True
 
-        # # Reward for exploring (changing actions)
-        # # NOTE: disabled for now because its not working well on continuous actions
-        # # Check for oscillation patterns in action history
-        # if not self._detect_oscillation(action):
-        #     if len(self.position_history) > 3:
-        #         recent_movement = self.agent_pos - self.position_history[0]
-        #         recent_movement_norm = np.linalg.norm(recent_movement)
+        # Reward for exploring (changing actions)
+        # NOTE: disabled for now because its not working well on continuous actions
+        # Check for oscillation patterns in action history
+        if not self._detect_oscillation(action):
+            if len(self.position_history) > 3:
+                recent_movement = self.agent_pos - self.position_history[0]
+                recent_movement_norm = np.linalg.norm(recent_movement)
 
-        #         if recent_movement_norm > MIN_MOVE_SPEED:
-        #             # Normalize the movement vector (only once)
-        #             recent_dir = recent_movement / recent_movement_norm
+                if recent_movement_norm > MIN_MOVE_SPEED:
+                    # Normalize the movement vector (only once)
+                    recent_dir = recent_movement / recent_movement_norm
 
-        #             # Check if the direction has changed
-        #             direction_changed = False
-        #             for i in range(1, min(3, len(self.position_history)-1)):
-        #                 prev_movement = self.position_history[i-1] - self.position_history[i]
-        #                 prev_movement_norm = np.linalg.norm(prev_movement)
+                    # Check if the direction has changed
+                    direction_changed = False
+                    for i in range(1, min(3, len(self.position_history) - 1)):
+                        prev_movement = (
+                            self.position_history[i - 1] - self.position_history[i]
+                        )
+                        prev_movement_norm = np.linalg.norm(prev_movement)
 
-        #                 if prev_movement_norm > MIN_MOVE_SPEED:
-        #                     prev_dir = prev_movement / prev_movement_norm
-        #                     # If dot product is less than threshold, directions are different
-        #                     if np.dot(recent_dir, prev_dir) < 0.8:  # Not too similar
-        #                         direction_changed = True
-        #                         break
+                        if prev_movement_norm > MIN_MOVE_SPEED:
+                            prev_dir = prev_movement / prev_movement_norm
+                            # If dot product is less than threshold, directions are different
+                            if np.dot(recent_dir, prev_dir) < 0.8:  # Not too similar
+                                direction_changed = True
+                                break
 
-        #             if direction_changed:
-        #                 reward += 0.2
-        # else:
-        #     reward -= 0.5
+                    if direction_changed:
+                        reward += 0.2
+        else:
+            reward -= 0.5
 
         # Reward for exploring new positions, use discretized position for our convience
         # Discretize position to track visited areas
@@ -684,6 +686,66 @@ class VisualSimulationEnv(gym.Env):
             self.target_distance_history = None
 
 
+class CoordConv(th.nn.Module):
+    """
+    Coordinate Convolutional Layer
+    Source: https://paperswithcode.com/method/coordconv
+
+    Adds coordinate channels to the input tensor before applying convolution.
+    Can optionally include a radial distance channel.
+    """
+
+    def __init__(
+        self,
+        input_channels,
+        output_channels,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        with_r=False,
+    ):
+        super(CoordConv, self).__init__()
+        # Add +2 for coordinate channels, +1 more if using radial distance
+        additional_channels = 3 if with_r else 2
+        self.with_r = with_r
+        self.conv = th.nn.Conv2d(
+            input_channels + additional_channels,
+            output_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+        )
+
+    def forward(self, x):
+        batch_size, _, height, width = x.shape
+
+        # Create coordinate channels
+        y_coords = (
+            th.linspace(-1, 1, height)
+            .view(1, 1, height, 1)
+            .expand(batch_size, 1, height, width)
+        )
+        x_coords = (
+            th.linspace(-1, 1, width)
+            .view(1, 1, 1, width)
+            .expand(batch_size, 1, height, width)
+        )
+
+        # Move to the same device as input
+        coords = th.cat([y_coords, x_coords], dim=1).to(x.device)
+
+        # Add radial distance channel if requested
+        if self.with_r:
+            # Calculate radial distance (Euclidean distance from center)
+            r_coords = th.sqrt(y_coords**2 + x_coords**2).to(x.device)
+            coords = th.cat([coords, r_coords], dim=1)
+
+        # Concatenate coordinates with input features
+        x_with_coords = th.cat([x, coords], dim=1)
+
+        return self.conv(x_with_coords)
+
+
 class VisionExtractor(BaseFeaturesExtractor):
     def __init__(
         self,
@@ -737,12 +799,32 @@ class VisionExtractor(BaseFeaturesExtractor):
                 )
 
         self.cnn = th.nn.Sequential(
-            th.nn.Conv2d(n_input_channels, 32, 8, stride=4),
-            th.nn.ReLU(),
-            th.nn.Conv2d(32, 64, 4, stride=2),
-            th.nn.ReLU(),
-            th.nn.Conv2d(64, 128, 3, stride=1),
-            th.nn.ReLU(),
+            # th.nn.Conv2d(n_input_channels, 32, 8, stride=4),
+            CoordConv(
+                # th.nn.Conv2d(
+                n_input_channels,
+                out_channels=8,
+                kernel_size=(3, 3),
+                stride=(2, 2),
+                padding=(1, 1),
+            ),
+            th.nn.LeakyReLU(),
+            th.nn.Conv2d(
+                in_channels=8,
+                out_channels=16,
+                kernel_size=(3, 3),
+                padding=(1, 1),
+                stride=(2, 2),
+            ),
+            th.nn.LeakyReLU(),
+            th.nn.Conv2d(
+                in_channels=16,
+                out_channels=32,
+                kernel_size=(3, 3),
+                padding=(1, 1),
+                stride=(2, 2),
+            ),
+            th.nn.LeakyReLU(),
             th.nn.Flatten(),
         )
 
@@ -1155,10 +1237,10 @@ if __name__ == "__main__":
     # Training parameters
     total_timesteps = 1000000
     check_freq = 50000  # Save checkpoint every 50k steps
-    MODEL_TAG = "PPO_FrameStack1_Res200_Continuous"
+    MODEL_TAG = "PPO_Res200_CoordConv_FrameStack4_KL_0.1_Continuous"
 
     # Create environment with frame stacking
-    n_stack = 1  # Stack 4 frames
+    n_stack = 4  # Stack 4 frames
     env, input_channels = create_env_with_frame_stacking(n_stack=n_stack)
 
     # Configure model parameters
@@ -1187,7 +1269,7 @@ if __name__ == "__main__":
         ent_coef=0.001,
         tensorboard_log=os.path.join("Training", "Logs"),
         device=device,
-        target_kl=0.05,
+        target_kl=0.1,
     )
 
     # Configure garbage collection

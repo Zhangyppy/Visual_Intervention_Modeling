@@ -20,7 +20,7 @@ SCREEN_HEIGHT = 400
 BLOCK_SIZE = 80
 AGENT_RADIUS = 20
 MAX_MOVE_SPEED = 40
-STACKED_FRAMES = 1
+STACKED_FRAMES = 4
 
 def create_simple_eval_env(render_mode="human"):
     """Creates a simple environment for human rendering without wrappers."""
