@@ -24,9 +24,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 # Pygame settings
 pygame.init()
-SCREEN_WIDTH = 400
-SCREEN_HEIGHT = 400
-GRID_SIZE = 40
+SCREEN_WIDTH = 200
+SCREEN_HEIGHT = 200
+GRID_SIZE = 10
 
 # Colors
 WHITE = (255, 255, 255)
@@ -35,8 +35,8 @@ RED = (255, 0, 0)
 BLUE = (0, 0, 255)
 
 # Constants
-AGENT_RADIUS = 20
-BLOCK_SIZE = 80
+AGENT_RADIUS = 10
+BLOCK_SIZE = 40
 MAX_MOVE_SPEED = 30  # Maximum speed for continuous actions
 MIN_MOVE_SPEED = 15   # Minimum speed for movement when action is non-zero
 
@@ -99,6 +99,12 @@ class VisualSimulationEnv(gym.Env):
                     shape=(2,),  # Agent's x, y position
                     dtype=np.float32,
                 ),
+                # "action_history": spaces.Box(
+                #     low=0,
+                #     high=255,
+                #     shape=(10,),
+                #     dtype=np.uint8,
+                # ),
             }
         )
 
@@ -411,34 +417,35 @@ class VisualSimulationEnv(gym.Env):
             if self.reward_count >= 3:
                 done = True
 
-        # Reward for exploring (changing actions)
-        # Check for oscillation patterns in action history
-        if not self._detect_oscillation(action):
-            if len(self.position_history) > 3:
-                recent_movement = self.agent_pos - self.position_history[0]
-                recent_movement_norm = np.linalg.norm(recent_movement)
+        # # Reward for exploring (changing actions)
+        # # NOTE: disabled for now because its not working well on continuous actions
+        # # Check for oscillation patterns in action history
+        # if not self._detect_oscillation(action):
+        #     if len(self.position_history) > 3:
+        #         recent_movement = self.agent_pos - self.position_history[0]
+        #         recent_movement_norm = np.linalg.norm(recent_movement)
                 
-                if recent_movement_norm > MIN_MOVE_SPEED:
-                    # Normalize the movement vector (only once)
-                    recent_dir = recent_movement / recent_movement_norm
+        #         if recent_movement_norm > MIN_MOVE_SPEED:
+        #             # Normalize the movement vector (only once)
+        #             recent_dir = recent_movement / recent_movement_norm
                     
-                    # Check if the direction has changed
-                    direction_changed = False
-                    for i in range(1, min(3, len(self.position_history)-1)):
-                        prev_movement = self.position_history[i-1] - self.position_history[i]
-                        prev_movement_norm = np.linalg.norm(prev_movement)
+        #             # Check if the direction has changed
+        #             direction_changed = False
+        #             for i in range(1, min(3, len(self.position_history)-1)):
+        #                 prev_movement = self.position_history[i-1] - self.position_history[i]
+        #                 prev_movement_norm = np.linalg.norm(prev_movement)
                         
-                        if prev_movement_norm > MIN_MOVE_SPEED:
-                            prev_dir = prev_movement / prev_movement_norm
-                            # If dot product is less than threshold, directions are different
-                            if np.dot(recent_dir, prev_dir) < 0.8:  # Not too similar
-                                direction_changed = True
-                                break
+        #                 if prev_movement_norm > MIN_MOVE_SPEED:
+        #                     prev_dir = prev_movement / prev_movement_norm
+        #                     # If dot product is less than threshold, directions are different
+        #                     if np.dot(recent_dir, prev_dir) < 0.8:  # Not too similar
+        #                         direction_changed = True
+        #                         break
 
-                    if direction_changed:
-                        reward += 0.2
-        else:
-            reward -= 0.5
+        #             if direction_changed:
+        #                 reward += 0.2
+        # else:
+        #     reward -= 0.5
 
         # Reward for exploring new positions, use discretized position for our convience
         # Discretize position to track visited areas
@@ -1064,7 +1071,7 @@ if __name__ == "__main__":
     # Training parameters
     total_timesteps = 1000000
     check_freq = 50000  # Save checkpoint every 50k steps
-    MODEL_TAG = "PPO_FrameStack1_NewRewardFix_Continuous"
+    MODEL_TAG = "PPO_FrameStack1_Res200_Continuous"
 
     # Create environment with frame stacking
     n_stack = 1  # Stack 4 frames
