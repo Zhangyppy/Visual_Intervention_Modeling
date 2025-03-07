@@ -1,12 +1,12 @@
 import datetime
 import gc
+import math
 from gymnasium import spaces
 import gymnasium as gym
 import numpy as np
 import pickle
 import time
 import pygame
-import numpy as np
 import random
 import os
 import torch as th
@@ -26,6 +26,7 @@ from torch.utils.tensorboard import SummaryWriter
 pygame.init()
 SCREEN_WIDTH = 400
 SCREEN_HEIGHT = 400
+GRID_SIZE = 40
 
 # Colors
 WHITE = (255, 255, 255)
@@ -37,6 +38,7 @@ BLUE = (0, 0, 255)
 AGENT_RADIUS = 20
 BLOCK_SIZE = 80
 MAX_MOVE_SPEED = 30  # Maximum speed for continuous actions
+MIN_MOVE_SPEED = 15   # Minimum speed for movement when action is non-zero
 
 # Check if CUDA or MPS is available
 device = (
@@ -47,6 +49,15 @@ device = (
 print(f"Using device: {device}")
 th.device(device)
 
+# _detect_oscillation parameters for tuning
+HISTORY_LENGTH = 10  # Track more positions for better pattern detection
+MIN_MOVEMENT_THRESHOLD = 1.05 * MIN_MOVE_SPEED # Min distance to be significant (NOTE: Once we figure out the reason why it refuse to move quicky, we can reduce this value)
+OSCILLATION_THRESHOLD = 0.6  # Dot product threshold for direction change (-0.6 = ~120 degree turn)
+MIN_REVERSALS = 3  # Number of direction reversals to detect oscillation
+LOCAL_MINIMUM_RADIUS = 0.15 * MAX_MOVE_SPEED  # Radius to detect if stuck in local area
+LOCAL_MIN_TIME_THRESHOLD = 8  # How many steps to be in local area to trigger
+TARGET_PROGRESS_THRESHOLD = 0.02 * SCREEN_WIDTH  # Progress toward target threshold
+COOLDOWN_STEPS = 5  # Steps to ignore oscillation detection after a trigger
 
 class VisualSimulationEnv(gym.Env):
     def __init__(self, render_mode=None):
@@ -88,17 +99,11 @@ class VisualSimulationEnv(gym.Env):
                     shape=(2,),  # Agent's x, y position
                     dtype=np.float32,
                 ),
-                # "action_history": spaces.Box(
-                #     low=0,
-                #     high=255,
-                #     shape=(10,),
-                #     dtype=np.uint8,
-                # ),
             }
         )
 
         # --- Episode Variables ---
-        self._ep_length = 150  # Max episode length
+        self._ep_length = 100  # Max episode length
         self._steps = 0  # Current step
 
         # Initialize positions of agent and target
@@ -116,6 +121,11 @@ class VisualSimulationEnv(gym.Env):
         self.action_history = np.full(
             10, 255, dtype=np.uint8
         )  # Reset action history with 255 (no action)
+        self.visited_positions = set()
+        self.position_history = [self.agent_pos.copy()]
+        self.target_distance_history = np.zeros(10, dtype=np.float32)
+        self.target_distance_history[0] = np.linalg.norm(self.agent_pos - self.target_pos)
+        self.oscillation_cooldown = 0
 
     def _initialize_positions(self):
         """Initialize agent and target positions"""
@@ -161,7 +171,16 @@ class VisualSimulationEnv(gym.Env):
         self.action_history = np.full(
             10, 255, dtype=np.uint8
         )  # Reset action history with 255 (no action)
-
+        self.position_history = [self.agent_pos.copy()]
+        self.target_distance_history = np.zeros(10, dtype=np.float32)
+        self.target_distance_history[0] = np.linalg.norm(self.agent_pos - self.target_pos)
+        self.oscillation_cooldown = 0
+        self.visited_positions = set()
+        
+        # Update cached target boundaries for observation rendering
+        if hasattr(self, '_cached_target_boundaries'):
+            self._cached_target_boundaries = self._get_target_boundaries()
+        
         # Process and handle events to avoid pygame becoming unresponsive
         if self.render_mode == "human":
             for event in pygame.event.get():
@@ -194,42 +213,136 @@ class VisualSimulationEnv(gym.Env):
 
     def _detect_oscillation(self, action):
         """
-        Detect if the agent is oscillating between actions.
+        Enhanced oscillation detection that handles both local minimum (not moving enough)
+        and looping behavior patterns.
         """
-        # Skip detection during initial steps
-        if self._steps < 6:
+        # Skip detection during initial steps or during cooldown
+        if self._steps < HISTORY_LENGTH:
             return False
-
-        # Store positions history if not already tracked
-        if not hasattr(self, 'position_history'):
-            self.position_history = np.zeros((6, 2), dtype=np.float32)
         
-        # Update position history
-        self.position_history = np.roll(self.position_history, 1, axis=0)
-        self.position_history[0] = self.agent_pos
+        # Handle cooldown after detecting oscillation
+        if hasattr(self, 'oscillation_cooldown') and self.oscillation_cooldown > 0:
+            self.oscillation_cooldown -= 1
+            return False
+        
+        # Initialize position history if not already tracked
+        if not hasattr(self, 'position_history'):
+            self.position_history = [self.agent_pos.copy()]  # Initialize as list
+            self.target_distance_history = np.zeros(HISTORY_LENGTH, dtype=np.float32)
+            self.oscillation_cooldown = 0
+        
+        # Update distance to target history
+        current_target_distance = np.linalg.norm(self.agent_pos - self.target_pos)
+        
+        if not hasattr(self, 'target_distance_history'):
+            self.target_distance_history = np.zeros(HISTORY_LENGTH, dtype=np.float32)
+            
+        self.target_distance_history = np.roll(self.target_distance_history, 1)
+        self.target_distance_history[0] = current_target_distance
         
         # Compute vectors between consecutive positions
-        vectors = np.diff(self.position_history, axis=0)
-        
-        # Calculate vector magnitudes (squared for efficiency)
-        magnitudes_squared = np.sum(vectors**2, axis=1)
-        min_movement_squared = (0.05 * MAX_MOVE_SPEED) ** 2
-        
-        # Only analyze significant movements
-        significant_movements = magnitudes_squared > min_movement_squared
-        if np.sum(significant_movements[:4]) < 4:
+        if len(self.position_history) < 2:
             return False
             
-        # Check for oscillation patterns in the last 5 movements
-        # 1. Check for reversal of direction (dot product negative)
-        dot_products = np.sum(vectors[:-1] * vectors[1:], axis=1)
-        normalized_dots = dot_products / np.sqrt(magnitudes_squared[:-1] * magnitudes_squared[1:] + 1e-8)
+        # Always convert position_history to numpy array for calculations
+        position_array = np.array(self.position_history[:HISTORY_LENGTH])
+            
+        # Compute vectors and magnitudes only once
+        vectors = np.diff(position_array, axis=0)
+        magnitudes = np.sqrt(np.sum(vectors**2, axis=1))
         
-        # 2. Count direction reversals (negative dot products)
-        direction_reversals = (normalized_dots < -0.6).sum()
+        # LOCAL MINIMUM DETECTION (not moving enough)
+        # ---------------------------------------
+        if len(position_array) >= LOCAL_MIN_TIME_THRESHOLD:
+            # 1. Check if agent is staying within a small radius
+            center = np.mean(position_array[:LOCAL_MIN_TIME_THRESHOLD], axis=0)
+            distances_from_center = np.sqrt(np.sum((position_array[:LOCAL_MIN_TIME_THRESHOLD] - center)**2, axis=1))
+            
+            # 2. Check if not making progress toward target
+            target_progress = self.target_distance_history[LOCAL_MIN_TIME_THRESHOLD-1] - self.target_distance_history[0]
+            
+            local_minimum_detected = (
+                # All recent positions are within a small radius
+                np.all(distances_from_center < LOCAL_MINIMUM_RADIUS) and
+                # Not making meaningful progress toward target
+                target_progress < TARGET_PROGRESS_THRESHOLD and
+                # Agent is actively trying to move (non-zero action)
+                np.any(np.abs(action) > 0.2)
+            )
+            
+            if local_minimum_detected:
+                # Set cooldown to prevent repeated triggers
+                self.oscillation_cooldown = COOLDOWN_STEPS
+                return True
         
-        # Return True if we detect at least 3 direction reversals in the last 5 movements
-        return direction_reversals >= 3
+        # MOVEMENT LOOPING DETECTION
+        # ---------------------------------------
+        # Only analyze significant movements 
+        significant_movements = magnitudes > MIN_MOVEMENT_THRESHOLD
+        if np.sum(significant_movements[:MIN_REVERSALS+1]) < MIN_REVERSALS+1:
+            return False
+        
+        # Check for oscillation patterns in recent movements
+        # 1. Get normalized vectors for significant movements only
+        significant_indices = np.where(significant_movements[:MIN_REVERSALS+1])[0]
+        if len(significant_indices) < MIN_REVERSALS+1:
+            return False
+            
+        # Pre-normalize all significant vectors at once
+        significant_vectors = vectors[significant_indices]
+        significant_magnitudes = magnitudes[significant_indices]
+        
+        # Avoid division by zero
+        valid_magnitudes = significant_magnitudes > 0
+        normalized_vectors = np.zeros_like(significant_vectors)
+        normalized_vectors[valid_magnitudes] = significant_vectors[valid_magnitudes] / significant_magnitudes[valid_magnitudes, np.newaxis]
+        
+        # 2. Calculate dot products between consecutive vectors
+        movement_pairs = min(len(normalized_vectors)-1, MIN_REVERSALS+1)
+        direction_changes = 0
+        
+        for i in range(movement_pairs):
+            if i+1 < len(normalized_vectors):
+                dot_product = np.sum(normalized_vectors[i] * normalized_vectors[i+1])
+                if dot_product < -OSCILLATION_THRESHOLD:
+                    direction_changes += 1
+        
+        looping_detected = direction_changes >= MIN_REVERSALS
+        
+        if looping_detected:
+            # Set cooldown to prevent repeated triggers
+            self.oscillation_cooldown = COOLDOWN_STEPS
+            return True
+        
+        # 3. Pattern detection - check if agent is revisiting same locations
+        if len(position_array) >= HISTORY_LENGTH:
+            # Create a spatial grid to detect revisited areas
+            visited_areas = {}
+            cell_size = SCREEN_WIDTH / 10  # Grid cell size (divide screen into 10x10 grid)
+            
+            # Count visits to each grid cell
+            for pos in position_array:
+                grid_x = int(pos[0] / cell_size)
+                grid_y = int(pos[1] / cell_size)
+                grid_key = (grid_x, grid_y)
+                
+                visited_areas[grid_key] = visited_areas.get(grid_key, 0) + 1
+            
+            # Check if any grid cell has been visited 3+ times
+            revisited_cells = sum(1 for count in visited_areas.values() if count >= 3)
+            
+            # If we've revisited cells multiple times and not making progress toward target
+            pattern_detected = (
+                revisited_cells >= 2 and 
+                target_progress < TARGET_PROGRESS_THRESHOLD and
+                self._steps > 20  # Only apply this after agent has had time to explore
+            )
+            
+            if pattern_detected:
+                self.oscillation_cooldown = COOLDOWN_STEPS
+                return True
+        
+        return False
 
     def step(self, action):
         # Process events to prevent pygame from becoming unresponsive
@@ -254,13 +367,8 @@ class VisualSimulationEnv(gym.Env):
         if vector_magnitude > 1e-6:
             # Normalize to unit vector
             normalized_action = action_vector / vector_magnitude
-            # Scale to max speed if exceeding unit magnitude
-            if vector_magnitude > 1.0:
-                action_vector = normalized_action
-            else:
-                action_vector = action_vector
-
-            move_vector = action_vector * MAX_MOVE_SPEED
+            speed = max(vector_magnitude * MAX_MOVE_SPEED, MIN_MOVE_SPEED)
+            move_vector = normalized_action * speed
         else:
             # Zero movement
             move_vector = np.zeros(2, dtype=np.float32)
@@ -283,11 +391,14 @@ class VisualSimulationEnv(gym.Env):
             [SCREEN_WIDTH - AGENT_RADIUS, SCREEN_HEIGHT - AGENT_RADIUS],
         )
 
-        # Calculate movement distance
-        # move_distance = np.linalg.norm(self.agent_pos - prev_pos)
+        # Update position history
+        self.position_history.insert(0, self.agent_pos.copy())
+        # Keep only the most recent positions to avoid memory issues
+        if len(self.position_history) > 10:  # Keep last 10 positions
+            self.position_history = self.position_history[:10]
 
         # --- Reward Structure ---
-        reward = 0
+        reward = -0.1
 
         # Boundary penalty
         if hit_boundary:
@@ -303,17 +414,42 @@ class VisualSimulationEnv(gym.Env):
         # Reward for exploring (changing actions)
         # Check for oscillation patterns in action history
         if not self._detect_oscillation(action):
-            # Diminishing exploration reward based on steps taken
-            exploration_reward = 0.3 / (1 + self.exploration_count * 0.1)
-            # Penalize if taking too many steps without reaching target
-            if (
-                self._steps > self._ep_length * 0.5
-            ):  # If more than 50% of episode length
-                exploration_reward -= 0.3 * (self._steps / self._ep_length)
-            reward += exploration_reward
-            self.exploration_count += 1
+            if len(self.position_history) > 3:
+                recent_movement = self.agent_pos - self.position_history[0]
+                recent_movement_norm = np.linalg.norm(recent_movement)
+                
+                if recent_movement_norm > MIN_MOVE_SPEED:
+                    # Normalize the movement vector (only once)
+                    recent_dir = recent_movement / recent_movement_norm
+                    
+                    # Check if the direction has changed
+                    direction_changed = False
+                    for i in range(1, min(3, len(self.position_history)-1)):
+                        prev_movement = self.position_history[i-1] - self.position_history[i]
+                        prev_movement_norm = np.linalg.norm(prev_movement)
+                        
+                        if prev_movement_norm > MIN_MOVE_SPEED:
+                            prev_dir = prev_movement / prev_movement_norm
+                            # If dot product is less than threshold, directions are different
+                            if np.dot(recent_dir, prev_dir) < 0.8:  # Not too similar
+                                direction_changed = True
+                                break
+
+                    if direction_changed:
+                        reward += 0.2
         else:
             reward -= 0.5
+
+        # Reward for exploring new positions, use discretized position for our convience
+        # Discretize position to track visited areas
+        grid_x = int(self.agent_pos[0] // GRID_SIZE)
+        grid_y = int(self.agent_pos[1] // GRID_SIZE)
+        grid_pos = (grid_x, grid_y)
+
+        if grid_pos not in self.visited_positions:
+            self.visited_positions.add(grid_pos)
+            # diminishing reward for finding new positions
+            reward += 0.5 * math.exp(len(self.visited_positions) * -0.05)
 
         # Check if episode is done due to step limit
         if self._steps >= self._ep_length:
@@ -328,13 +464,16 @@ class VisualSimulationEnv(gym.Env):
         # Create a canvas for the full screen observation or reuse existing one
         if not hasattr(self, '_obs_canvas'):
             self._obs_canvas = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+            
+            self._visual_obs_buffer = np.empty((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8)
+            self._cached_target_boundaries = self._get_target_boundaries()
         
         # Reuse canvas to avoid memory allocation each time
         canvas = self._obs_canvas
         canvas.fill(WHITE)
 
-        # Draw the blue target block
-        target_x_min, target_y_min, _, _ = self._get_target_boundaries()
+        # Draw the blue target block using cached boundaries
+        target_x_min, target_y_min, _, _ = self._cached_target_boundaries
         pygame.draw.rect(
             canvas, BLUE, (target_x_min, target_y_min, BLOCK_SIZE, BLOCK_SIZE)
         )
@@ -345,10 +484,6 @@ class VisualSimulationEnv(gym.Env):
         # draw the space boundaries outer boundary
         pygame.draw.rect(canvas, BLACK, (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT), 5)
 
-        # Convert the canvas to a numpy array - reuse buffer if possible
-        if not hasattr(self, '_visual_obs_buffer') or self._visual_obs_buffer.shape != (SCREEN_HEIGHT, SCREEN_WIDTH, 3):
-            self._visual_obs_buffer = np.empty((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8)
-        
         # Get pixel data into our buffer - more efficient than creating new array
         # PyGame returns in (W, H, C) format, convert to (H, W, C)
         pygame.pixelcopy.surface_to_array(np.transpose(self._visual_obs_buffer, (1, 0, 2)), canvas)
@@ -358,6 +493,7 @@ class VisualSimulationEnv(gym.Env):
             "visual": self._visual_obs_buffer,
             "position": self.agent_pos.astype(np.float32),
             "action_history": self.action_history,
+            "target": self.target_pos.astype(np.float32)
         }
 
     def render(self, mode="human"):
@@ -480,19 +616,24 @@ class VisualSimulationEnv(gym.Env):
         """
         # Free pygame resources
         if hasattr(self, 'screen') and self.screen is not None:
+            pygame.display.quit()  # Properly quit the display
             pygame.quit()
         
         # Explicitly free the observation canvas to avoid memory leaks
         if hasattr(self, '_obs_canvas'):
+            self._obs_canvas = None
             del self._obs_canvas
         
         # Free any other buffers
         if hasattr(self, '_visual_obs_buffer'):
             del self._visual_obs_buffer
             
-        # Clear position history if it exists
+        # Clear history collections
         if hasattr(self, 'position_history'):
-            del self.position_history
+            self.position_history = []
+            
+        if hasattr(self, 'target_distance_history'):
+            self.target_distance_history = None
 
 
 class VisionExtractor(BaseFeaturesExtractor):
@@ -920,8 +1061,13 @@ class MemoryManagementCallback(BaseCallback):
 
 # Only run training code when script is executed directly (not imported)
 if __name__ == "__main__":
+    # Training parameters
+    total_timesteps = 1000000
+    check_freq = 50000  # Save checkpoint every 50k steps
+    MODEL_TAG = "PPO_FrameStack1_NewRewardFix_Continuous"
+
     # Create environment with frame stacking
-    n_stack = 4  # Stack 4 frames
+    n_stack = 1  # Stack 4 frames
     env, input_channels = create_env_with_frame_stacking(n_stack=n_stack)
 
     # Configure model parameters
@@ -946,17 +1092,12 @@ if __name__ == "__main__":
         policy_kwargs=policy_kwargs,
         learning_rate=3e-4,
         n_steps=2048,
-        batch_size=256,
-        ent_coef=0.005,
+        batch_size=512,
+        ent_coef=0.001,
         tensorboard_log=os.path.join("Training", "Logs"),
         device=device,
         target_kl=0.05,
     )
-
-    # Training parameters
-    total_timesteps = 1000000
-    check_freq = 50000  # Save checkpoint every 50k steps
-    MODEL_TAG = "PPO_FrameStack4_Continuous"
 
     # Configure garbage collection
     gc.enable()

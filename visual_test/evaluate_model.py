@@ -19,7 +19,8 @@ SCREEN_WIDTH = 400
 SCREEN_HEIGHT = 400
 BLOCK_SIZE = 80
 AGENT_RADIUS = 20
-MOVE_SPEED = 20
+MAX_MOVE_SPEED = 40
+STACKED_FRAMES = 1
 
 def create_simple_eval_env(render_mode="human"):
     """Creates a simple environment for human rendering without wrappers."""
@@ -42,8 +43,8 @@ def manual_evaluate(model, env, n_episodes=10):
         step_count = 0
         
         # Initialize frame stacking with duplicate frames
-        frames_history = [obs["visual"]] * 4
-        positions_history = [obs["position"]] * 4
+        frames_history = [obs["visual"]] * STACKED_FRAMES
+        positions_history = [obs["position"]] * STACKED_FRAMES
         
         while not (done or truncated) and step_count < 100:
             try:
