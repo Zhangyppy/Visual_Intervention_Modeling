@@ -16,7 +16,11 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecFrameStack
 from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage, SubprocVecEnv
+from stable_baselines3.common.vec_env import (
+    DummyVecEnv,
+    VecTransposeImage,
+    SubprocVecEnv,
+)
 from stable_baselines3.common.preprocessing import is_image_space
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from sb3_contrib import RecurrentPPO
@@ -38,7 +42,7 @@ BLUE = (0, 0, 255)
 AGENT_RADIUS = 10
 BLOCK_SIZE = 40
 MAX_MOVE_SPEED = 30  # Maximum speed for continuous actions
-MIN_MOVE_SPEED = 15   # Minimum speed for movement when action is non-zero
+MIN_MOVE_SPEED = 15  # Minimum speed for movement when action is non-zero
 
 # Check if CUDA or MPS is available
 device = (
@@ -51,13 +55,18 @@ th.device(device)
 
 # _detect_oscillation parameters for tuning
 HISTORY_LENGTH = 10  # Track more positions for better pattern detection
-MIN_MOVEMENT_THRESHOLD = 1.05 * MIN_MOVE_SPEED # Min distance to be significant (NOTE: Once we figure out the reason why it refuse to move quicky, we can reduce this value)
-OSCILLATION_THRESHOLD = 0.6  # Dot product threshold for direction change (-0.6 = ~120 degree turn)
+MIN_MOVEMENT_THRESHOLD = (
+    1.05 * MIN_MOVE_SPEED
+)  # Min distance to be significant (NOTE: Once we figure out the reason why it refuse to move quicky, we can reduce this value)
+OSCILLATION_THRESHOLD = (
+    0.6  # Dot product threshold for direction change (-0.6 = ~120 degree turn)
+)
 MIN_REVERSALS = 3  # Number of direction reversals to detect oscillation
 LOCAL_MINIMUM_RADIUS = 0.15 * MAX_MOVE_SPEED  # Radius to detect if stuck in local area
 LOCAL_MIN_TIME_THRESHOLD = 8  # How many steps to be in local area to trigger
 TARGET_PROGRESS_THRESHOLD = 0.02 * SCREEN_WIDTH  # Progress toward target threshold
 COOLDOWN_STEPS = 5  # Steps to ignore oscillation detection after a trigger
+
 
 class VisualSimulationEnv(gym.Env):
     def __init__(self, render_mode=None):
@@ -74,7 +83,7 @@ class VisualSimulationEnv(gym.Env):
             low=np.array([-1, -1], dtype=np.float32),
             high=np.array([1, 1], dtype=np.float32),
             shape=(2,),
-            dtype=np.float32
+            dtype=np.float32,
         )
 
         # --- OBSERVATION SPACE ---
@@ -130,7 +139,9 @@ class VisualSimulationEnv(gym.Env):
         self.visited_positions = set()
         self.position_history = [self.agent_pos.copy()]
         self.target_distance_history = np.zeros(10, dtype=np.float32)
-        self.target_distance_history[0] = np.linalg.norm(self.agent_pos - self.target_pos)
+        self.target_distance_history[0] = np.linalg.norm(
+            self.agent_pos - self.target_pos
+        )
         self.oscillation_cooldown = 0
 
     def _initialize_positions(self):
@@ -179,14 +190,16 @@ class VisualSimulationEnv(gym.Env):
         )  # Reset action history with 255 (no action)
         self.position_history = [self.agent_pos.copy()]
         self.target_distance_history = np.zeros(10, dtype=np.float32)
-        self.target_distance_history[0] = np.linalg.norm(self.agent_pos - self.target_pos)
+        self.target_distance_history[0] = np.linalg.norm(
+            self.agent_pos - self.target_pos
+        )
         self.oscillation_cooldown = 0
         self.visited_positions = set()
-        
+
         # Update cached target boundaries for observation rendering
-        if hasattr(self, '_cached_target_boundaries'):
+        if hasattr(self, "_cached_target_boundaries"):
             self._cached_target_boundaries = self._get_target_boundaries()
-        
+
         # Process and handle events to avoid pygame becoming unresponsive
         if self.render_mode == "human":
             for event in pygame.event.get():
@@ -225,129 +238,144 @@ class VisualSimulationEnv(gym.Env):
         # Skip detection during initial steps or during cooldown
         if self._steps < HISTORY_LENGTH:
             return False
-        
+
         # Handle cooldown after detecting oscillation
-        if hasattr(self, 'oscillation_cooldown') and self.oscillation_cooldown > 0:
+        if hasattr(self, "oscillation_cooldown") and self.oscillation_cooldown > 0:
             self.oscillation_cooldown -= 1
             return False
-        
+
         # Initialize position history if not already tracked
-        if not hasattr(self, 'position_history'):
+        if not hasattr(self, "position_history"):
             self.position_history = [self.agent_pos.copy()]  # Initialize as list
             self.target_distance_history = np.zeros(HISTORY_LENGTH, dtype=np.float32)
             self.oscillation_cooldown = 0
-        
+
         # Update distance to target history
         current_target_distance = np.linalg.norm(self.agent_pos - self.target_pos)
-        
-        if not hasattr(self, 'target_distance_history'):
+
+        if not hasattr(self, "target_distance_history"):
             self.target_distance_history = np.zeros(HISTORY_LENGTH, dtype=np.float32)
-            
+
         self.target_distance_history = np.roll(self.target_distance_history, 1)
         self.target_distance_history[0] = current_target_distance
-        
+
         # Compute vectors between consecutive positions
         if len(self.position_history) < 2:
             return False
-            
+
         # Always convert position_history to numpy array for calculations
         position_array = np.array(self.position_history[:HISTORY_LENGTH])
-            
+
         # Compute vectors and magnitudes only once
         vectors = np.diff(position_array, axis=0)
         magnitudes = np.sqrt(np.sum(vectors**2, axis=1))
-        
+
         # LOCAL MINIMUM DETECTION (not moving enough)
         # ---------------------------------------
         if len(position_array) >= LOCAL_MIN_TIME_THRESHOLD:
             # 1. Check if agent is staying within a small radius
             center = np.mean(position_array[:LOCAL_MIN_TIME_THRESHOLD], axis=0)
-            distances_from_center = np.sqrt(np.sum((position_array[:LOCAL_MIN_TIME_THRESHOLD] - center)**2, axis=1))
-            
+            distances_from_center = np.sqrt(
+                np.sum(
+                    (position_array[:LOCAL_MIN_TIME_THRESHOLD] - center) ** 2, axis=1
+                )
+            )
+
             # 2. Check if not making progress toward target
-            target_progress = self.target_distance_history[LOCAL_MIN_TIME_THRESHOLD-1] - self.target_distance_history[0]
-            
+            target_progress = (
+                self.target_distance_history[LOCAL_MIN_TIME_THRESHOLD - 1]
+                - self.target_distance_history[0]
+            )
+
             local_minimum_detected = (
                 # All recent positions are within a small radius
-                np.all(distances_from_center < LOCAL_MINIMUM_RADIUS) and
+                np.all(distances_from_center < LOCAL_MINIMUM_RADIUS)
+                and
                 # Not making meaningful progress toward target
-                target_progress < TARGET_PROGRESS_THRESHOLD and
+                target_progress < TARGET_PROGRESS_THRESHOLD
+                and
                 # Agent is actively trying to move (non-zero action)
                 np.any(np.abs(action) > 0.2)
             )
-            
+
             if local_minimum_detected:
                 # Set cooldown to prevent repeated triggers
                 self.oscillation_cooldown = COOLDOWN_STEPS
                 return True
-        
+
         # MOVEMENT LOOPING DETECTION
         # ---------------------------------------
-        # Only analyze significant movements 
+        # Only analyze significant movements
         significant_movements = magnitudes > MIN_MOVEMENT_THRESHOLD
-        if np.sum(significant_movements[:MIN_REVERSALS+1]) < MIN_REVERSALS+1:
+        if np.sum(significant_movements[: MIN_REVERSALS + 1]) < MIN_REVERSALS + 1:
             return False
-        
+
         # Check for oscillation patterns in recent movements
         # 1. Get normalized vectors for significant movements only
-        significant_indices = np.where(significant_movements[:MIN_REVERSALS+1])[0]
-        if len(significant_indices) < MIN_REVERSALS+1:
+        significant_indices = np.where(significant_movements[: MIN_REVERSALS + 1])[0]
+        if len(significant_indices) < MIN_REVERSALS + 1:
             return False
-            
+
         # Pre-normalize all significant vectors at once
         significant_vectors = vectors[significant_indices]
         significant_magnitudes = magnitudes[significant_indices]
-        
+
         # Avoid division by zero
         valid_magnitudes = significant_magnitudes > 0
         normalized_vectors = np.zeros_like(significant_vectors)
-        normalized_vectors[valid_magnitudes] = significant_vectors[valid_magnitudes] / significant_magnitudes[valid_magnitudes, np.newaxis]
-        
+        normalized_vectors[valid_magnitudes] = (
+            significant_vectors[valid_magnitudes]
+            / significant_magnitudes[valid_magnitudes, np.newaxis]
+        )
+
         # 2. Calculate dot products between consecutive vectors
-        movement_pairs = min(len(normalized_vectors)-1, MIN_REVERSALS+1)
+        movement_pairs = min(len(normalized_vectors) - 1, MIN_REVERSALS + 1)
         direction_changes = 0
-        
+
         for i in range(movement_pairs):
-            if i+1 < len(normalized_vectors):
-                dot_product = np.sum(normalized_vectors[i] * normalized_vectors[i+1])
+            if i + 1 < len(normalized_vectors):
+                dot_product = np.sum(normalized_vectors[i] * normalized_vectors[i + 1])
                 if dot_product < -OSCILLATION_THRESHOLD:
                     direction_changes += 1
-        
+
         looping_detected = direction_changes >= MIN_REVERSALS
-        
+
         if looping_detected:
             # Set cooldown to prevent repeated triggers
             self.oscillation_cooldown = COOLDOWN_STEPS
             return True
-        
+
         # 3. Pattern detection - check if agent is revisiting same locations
         if len(position_array) >= HISTORY_LENGTH:
             # Create a spatial grid to detect revisited areas
             visited_areas = {}
-            cell_size = SCREEN_WIDTH / 10  # Grid cell size (divide screen into 10x10 grid)
-            
+            cell_size = (
+                SCREEN_WIDTH / 10
+            )  # Grid cell size (divide screen into 10x10 grid)
+
             # Count visits to each grid cell
             for pos in position_array:
                 grid_x = int(pos[0] / cell_size)
                 grid_y = int(pos[1] / cell_size)
                 grid_key = (grid_x, grid_y)
-                
+
                 visited_areas[grid_key] = visited_areas.get(grid_key, 0) + 1
-            
+
             # Check if any grid cell has been visited 3+ times
             revisited_cells = sum(1 for count in visited_areas.values() if count >= 3)
-            
+
             # If we've revisited cells multiple times and not making progress toward target
             pattern_detected = (
-                revisited_cells >= 2 and 
-                target_progress < TARGET_PROGRESS_THRESHOLD and
-                self._steps > 20  # Only apply this after agent has had time to explore
+                revisited_cells >= 2
+                and target_progress < TARGET_PROGRESS_THRESHOLD
+                and self._steps
+                > 20  # Only apply this after agent has had time to explore
             )
-            
+
             if pattern_detected:
                 self.oscillation_cooldown = COOLDOWN_STEPS
                 return True
-        
+
         return False
 
     def step(self, action):
@@ -362,13 +390,15 @@ class VisualSimulationEnv(gym.Env):
 
         # Update action history
         self.action_history = np.roll(self.action_history, 1)
-        self.action_history[0] = int(np.argmax(np.abs(action)))  # Store strongest direction for history
+        self.action_history[0] = int(
+            np.argmax(np.abs(action))
+        )  # Store strongest direction for history
 
         # Normalize and scale the action vector
         # Actions are in range [-1, 1], scale them by MAX_MOVE_SPEED
         action_vector = np.array(action, dtype=np.float32)
         vector_magnitude = np.linalg.norm(action_vector)
-        
+
         # Normalize only if the magnitude is not zero to avoid division by zero
         if vector_magnitude > 1e-6:
             # Normalize to unit vector
@@ -378,7 +408,7 @@ class VisualSimulationEnv(gym.Env):
         else:
             # Zero movement
             move_vector = np.zeros(2, dtype=np.float32)
-            
+
         # Calculate the intended (unclipped) position
         intended_pos = self.agent_pos + move_vector
 
@@ -424,17 +454,17 @@ class VisualSimulationEnv(gym.Env):
         #     if len(self.position_history) > 3:
         #         recent_movement = self.agent_pos - self.position_history[0]
         #         recent_movement_norm = np.linalg.norm(recent_movement)
-                
+
         #         if recent_movement_norm > MIN_MOVE_SPEED:
         #             # Normalize the movement vector (only once)
         #             recent_dir = recent_movement / recent_movement_norm
-                    
+
         #             # Check if the direction has changed
         #             direction_changed = False
         #             for i in range(1, min(3, len(self.position_history)-1)):
         #                 prev_movement = self.position_history[i-1] - self.position_history[i]
         #                 prev_movement_norm = np.linalg.norm(prev_movement)
-                        
+
         #                 if prev_movement_norm > MIN_MOVE_SPEED:
         #                     prev_dir = prev_movement / prev_movement_norm
         #                     # If dot product is less than threshold, directions are different
@@ -469,12 +499,14 @@ class VisualSimulationEnv(gym.Env):
 
     def _get_obs(self):
         # Create a canvas for the full screen observation or reuse existing one
-        if not hasattr(self, '_obs_canvas'):
+        if not hasattr(self, "_obs_canvas"):
             self._obs_canvas = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
-            
-            self._visual_obs_buffer = np.empty((SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8)
+
+            self._visual_obs_buffer = np.empty(
+                (SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8
+            )
             self._cached_target_boundaries = self._get_target_boundaries()
-        
+
         # Reuse canvas to avoid memory allocation each time
         canvas = self._obs_canvas
         canvas.fill(WHITE)
@@ -493,14 +525,16 @@ class VisualSimulationEnv(gym.Env):
 
         # Get pixel data into our buffer - more efficient than creating new array
         # PyGame returns in (W, H, C) format, convert to (H, W, C)
-        pygame.pixelcopy.surface_to_array(np.transpose(self._visual_obs_buffer, (1, 0, 2)), canvas)
-        
+        pygame.pixelcopy.surface_to_array(
+            np.transpose(self._visual_obs_buffer, (1, 0, 2)), canvas
+        )
+
         # Return both visual observation and position information
         return {
             "visual": self._visual_obs_buffer,
             "position": self.agent_pos.astype(np.float32),
-            "action_history": self.action_history,
-            "target": self.target_pos.astype(np.float32)
+            # "action_history": self.action_history,
+            # "target": self.target_pos.astype(np.float32)
         }
 
     def render(self, mode="human"):
@@ -622,73 +656,81 @@ class VisualSimulationEnv(gym.Env):
         Clean up resources used by the environment.
         """
         # Free pygame resources
-        if hasattr(self, 'screen') and self.screen is not None:
+        if hasattr(self, "screen") and self.screen is not None:
             pygame.display.quit()  # Properly quit the display
             pygame.quit()
-        
+
         # Explicitly free the observation canvas to avoid memory leaks
-        if hasattr(self, '_obs_canvas'):
+        if hasattr(self, "_obs_canvas"):
             self._obs_canvas = None
             del self._obs_canvas
-        
+
         # Free any other buffers
-        if hasattr(self, '_visual_obs_buffer'):
+        if hasattr(self, "_visual_obs_buffer"):
             del self._visual_obs_buffer
-            
+
         # Clear history collections
-        if hasattr(self, 'position_history'):
+        if hasattr(self, "position_history"):
             self.position_history = []
-            
-        if hasattr(self, 'target_distance_history'):
+
+        if hasattr(self, "target_distance_history"):
             self.target_distance_history = None
 
 
 class VisionExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Dict, features_dim: int = 256, input_channels=None, resize_to=None):
+    def __init__(
+        self,
+        observation_space: gym.spaces.Dict,
+        features_dim: int = 256,
+        input_channels=None,
+        resize_to=None,
+    ):
         # Initialize with the visual part of the observation space
         super().__init__(observation_space, features_dim)
 
         # Store the resize dimensions
         self.resize_to = resize_to
         if resize_to is not None:
-            print(f"Visual input will be resized from {SCREEN_WIDTH}x{SCREEN_HEIGHT} to {resize_to[0]}x{resize_to[1]}")
+            print(
+                f"Visual input will be resized from {SCREEN_WIDTH}x{SCREEN_HEIGHT} to {resize_to[0]}x{resize_to[1]}"
+            )
 
         # Extract shapes from the observation space
         # The format depends on whether the CustomVecTranspose was applied or not
         visual_space = observation_space["visual"]
-        
+
         # If input_channels is specified, use it (for frame stacking)
         if input_channels is not None:
             n_input_channels = input_channels
             print(f"Using provided input channels: {n_input_channels}")
         else:
             # Determine the correct channel dimension
-            if len(visual_space.shape) == 3:  # (C, H, W) format after CustomVecTranspose
+            if (
+                len(visual_space.shape) == 3
+            ):  # (C, H, W) format after CustomVecTranspose
                 n_input_channels = visual_space.shape[0]
             else:  # (H, W, C) format before CustomVecTranspose
                 n_input_channels = visual_space.shape[2]
-            
+
         pos_dim = observation_space["position"].shape[0]
         # action_history_dim = observation_space["action_history"].shape[0]
-        
+
         print(f"Initializing CNN with {n_input_channels} input channels")
 
         # Add a resize layer if resize_to is specified
         if resize_to is not None:
             if th.cuda.is_available():
                 self.resize = th.nn.Sequential(
-                    th.nn.Upsample(size=resize_to, mode='bilinear', align_corners=False)
+                    th.nn.Upsample(size=resize_to, mode="bilinear", align_corners=False)
                 )
             else:
                 # Without CUDA, use a simpler approach
                 self.resize = lambda x: th.nn.functional.interpolate(
-                    x, size=resize_to, mode='bilinear', align_corners=False
+                    x, size=resize_to, mode="bilinear", align_corners=False
                 )
 
         self.cnn = th.nn.Sequential(
-            th.nn.Conv2d(
-                n_input_channels, 32, 8, stride=4
-            ),
+            th.nn.Conv2d(n_input_channels, 32, 8, stride=4),
             th.nn.ReLU(),
             th.nn.Conv2d(32, 64, 4, stride=2),
             th.nn.ReLU(),
@@ -708,26 +750,30 @@ class VisionExtractor(BaseFeaturesExtractor):
                     height, width = visual_space.shape[1], visual_space.shape[2]
                 else:  # HWC format
                     height, width = visual_space.shape[0], visual_space.shape[1]
-                
+
                 # Create a correctly shaped tensor filled with zeros
                 sample = th.zeros((1, input_channels, height, width), dtype=th.float32)
                 print(f"Created dummy sample with shape: {sample.shape}")
             else:
                 # Standard case - use the observation space's sample method
                 sample = th.as_tensor(visual_space.sample(), dtype=th.float32)
-                
+
                 # Convert to NCHW format if needed
                 if len(sample.shape) == 3:
                     if sample.shape[0] <= 3:  # Already CHW format
                         sample = sample.unsqueeze(0)  # Add batch dimension
                     else:  # HWC format
-                        sample = sample.permute(2, 0, 1).unsqueeze(0)  # Convert and add batch
-                
+                        sample = sample.permute(2, 0, 1).unsqueeze(
+                            0
+                        )  # Convert and add batch
+
             print(f"Original sample shape: {sample.shape}")  # Should be (1, C, H, W)
             # Resize the sample if resize_to is specified
             if self.resize_to is not None:
                 resized_sample = self.resize(sample)
-                print(f"Resized sample shape: {resized_sample.shape}")  # Should be (1, C, resize_h, resize_w)
+                print(
+                    f"Resized sample shape: {resized_sample.shape}"
+                )  # Should be (1, C, resize_h, resize_w)
             else:
                 resized_sample = sample
             n_flatten = self.cnn(resized_sample).shape[1]
@@ -750,7 +796,8 @@ class VisionExtractor(BaseFeaturesExtractor):
             # th.nn.Linear(n_flatten + 64, features_dim),
             # th.nn.LayerNorm(features_dim),
             # th.nn.ReLU(),
-            th.nn.Linear(n_flatten + 64, features_dim), th.nn.ReLU()
+            th.nn.Linear(n_flatten + 64, features_dim),
+            th.nn.ReLU(),
         )
 
     def forward(self, observations: dict) -> th.Tensor:
@@ -765,24 +812,37 @@ class VisionExtractor(BaseFeaturesExtractor):
             # Pin memory if using CUDA for faster host-to-device transfer
             if th.cuda.is_available():
                 # Reuse buffer if possible to reduce memory allocations
-                if not hasattr(self, '_visual_tensor_buffer') or self._visual_tensor_buffer.shape[1:] != observations["visual"].shape:
+                if (
+                    not hasattr(self, "_visual_tensor_buffer")
+                    or self._visual_tensor_buffer.shape[1:]
+                    != observations["visual"].shape
+                ):
                     shape = observations["visual"].shape
-                    self._visual_tensor_buffer = th.empty((1,) + shape if len(shape) == 3 else shape, dtype=th.float32, device="cuda")
-                
+                    self._visual_tensor_buffer = th.empty(
+                        (1,) + shape if len(shape) == 3 else shape,
+                        dtype=th.float32,
+                        device="cuda",
+                    )
+
                 # Copy directly into the buffer
                 visual_obs = self._visual_tensor_buffer
-                visual_obs.copy_(th.as_tensor(observations["visual"], dtype=th.float32, device="cuda"), non_blocking=True)
+                visual_obs.copy_(
+                    th.as_tensor(
+                        observations["visual"], dtype=th.float32, device="cuda"
+                    ),
+                    non_blocking=True,
+                )
             else:
                 visual_obs = th.as_tensor(observations["visual"], dtype=th.float32)
-        
+
         # Add batch dimension (CHW -> NCHW)
         if visual_obs.dim() == 3:
             visual_obs = visual_obs.unsqueeze(0)  # (C,H,W) -> (1,C,H,W)
-        
+
         # Apply resize function if needed
         if self.resize_to is not None:
             visual_obs = self.resize(visual_obs)
-        
+
         visual_features = self.cnn(visual_obs)
 
         # Process position features
@@ -794,14 +854,16 @@ class VisionExtractor(BaseFeaturesExtractor):
         else:
             # Use cuda if available for consistency with visual features
             if th.cuda.is_available():
-                pos_obs = th.as_tensor(observations["position"], dtype=th.float32, device="cuda")
+                pos_obs = th.as_tensor(
+                    observations["position"], dtype=th.float32, device="cuda"
+                )
             else:
                 pos_obs = th.as_tensor(observations["position"], dtype=th.float32)
-            
+
         # Add batch dimension if needed
         if pos_obs.dim() == 1:
             pos_obs = pos_obs.unsqueeze(0)  # (2,) -> (1,2)
-            
+
         pos_features = self.pos_net(pos_obs)
 
         # Process action history features
@@ -814,24 +876,26 @@ class VisionExtractor(BaseFeaturesExtractor):
 
         # Combine features
         # combined = th.cat([visual_features, pos_features], dim=1)
-        
+
         return self.combined(th.cat([visual_features, pos_features], dim=1))
 
 
 class CustomVecTranspose(VecTransposeImage):
     def __init__(self, venv):
         super().__init__(venv)
-        
+
         # Get the number of stacked frames from the VecFrameStack wrapper
         # Default to 1 if not frame stacked
         self.n_stack = getattr(venv, "n_stack", 1)
-        
+
         # Get the number of channels from the original visual observation space
         # This is the number of channels AFTER stacking (e.g., 12 for 4 stacks of RGB)
         orig_visual_shape = venv.observation_space["visual"].shape
         n_channels = orig_visual_shape[-1]  # Last dimension is channels in HWC format
-        
-        print(f"Original visual shape: {orig_visual_shape}, detected {n_channels} channels")
+
+        print(
+            f"Original visual shape: {orig_visual_shape}, detected {n_channels} channels"
+        )
 
         # Update observation space to handle dictionary
         self.observation_space = spaces.Dict(
@@ -839,7 +903,11 @@ class CustomVecTranspose(VecTransposeImage):
                 "visual": spaces.Box(
                     low=0,
                     high=255,
-                    shape=(n_channels, SCREEN_HEIGHT, SCREEN_WIDTH),  # CHW format with stacked frames
+                    shape=(
+                        n_channels,
+                        SCREEN_HEIGHT,
+                        SCREEN_WIDTH,
+                    ),  # CHW format with stacked frames
                     dtype=np.uint8,
                 ),
                 "position": venv.observation_space[
@@ -872,33 +940,39 @@ class CustomVecTranspose(VecTransposeImage):
         # Remove any extra batch dimension from DummyVecEnv if present
         if isinstance(visual_obs, np.ndarray) and len(visual_obs.shape) == 4:
             visual_obs = visual_obs[0]  # Convert (1, H, W, C) to (H, W, C)
-        
+
         if isinstance(position, np.ndarray) and len(position.shape) == 2:
             position = position[0]  # Convert (1, 2) to (2,)
 
         # Convert from HWC to CHW format - only once and only if needed
         # Check if already in CHW format to avoid unnecessary transpose
-        if isinstance(visual_obs, np.ndarray) and len(visual_obs.shape) == 3 and visual_obs.shape[2] <= 12:
+        if (
+            isinstance(visual_obs, np.ndarray)
+            and len(visual_obs.shape) == 3
+            and visual_obs.shape[2] <= 12
+        ):
             # Standard case - needs transpose
 
             h, w, c = visual_obs.shape
-            
+
             # Create or resize transpose buffer if needed
-            if not hasattr(self, '_transpose_buffer') or self._transpose_buffer.shape != (c, h, w):
+            if not hasattr(
+                self, "_transpose_buffer"
+            ) or self._transpose_buffer.shape != (c, h, w):
                 # First usage or shape changed, create new buffer with exact shape needed
                 self._transpose_buffer = np.empty((c, h, w), dtype=visual_obs.dtype)
-            
+
             # Manual optimized transpose to reuse existing buffer (no new allocation)
             # it should faster than np.transpose which would create a new array
             for i in range(c):
                 # Direct slice assignment is more efficient than np.copyto
                 self._transpose_buffer[i] = visual_obs[:, :, i]
-            
+
             visual_result = self._transpose_buffer
         else:
             # Already in the right format or special case, no need to transpose
             visual_result = visual_obs
-            
+
         return {
             "visual": visual_result,
             "position": position,
@@ -983,27 +1057,27 @@ def make_env():
 # Helper for creating an environment with proper frame stacking
 def create_env_with_frame_stacking(n_stack=4):
     """
-    Create an environment with frame stacking properly configured for 
+    Create an environment with frame stacking properly configured for
     dictionary observations and CHW format.
-    
+
     Args:
         n_stack: Number of frames to stack
-        
+
     Returns:
         A properly configured environment with frame stacking
     """
     # Create base environment
     env = DummyVecEnv([make_env])
     print(f"Original observation space: {env.observation_space}")
-    
+
     # Apply frame stacking
     env = VecFrameStack(env, n_stack=n_stack)
     print(f"After VecFrameStack: {env.observation_space}")
-    
+
     # Apply custom transpose
     env = CustomVecTranspose(env)
     print(f"After CustomVecTranspose: {env.observation_space}")
-    
+
     return env, 3 * n_stack  # Return env and number of input channels
 
 
@@ -1011,34 +1085,35 @@ def create_env_with_frame_stacking(n_stack=4):
 def create_eval_env_with_frame_stacking(n_stack=4, render_mode="human", debug=False):
     """
     Create an evaluation environment with frame stacking and rendering support.
-    
+
     Args:
         n_stack: Number of frames to stack (must match training)
         render_mode: The rendering mode to use (e.g., "human")
         debug: Whether to enable debug output for observations
-        
+
     Returns:
         A properly configured environment for evaluation
     """
+
     # Create a function that returns a properly configured env with render mode
     def make_env_with_render():
         env = VisualSimulationEnv(render_mode=render_mode)
         env = Monitor(env)
 
         return env
-    
+
     # Create vectorized environment
     env = DummyVecEnv([make_env_with_render])
     print(f"Eval env - original observation space: {env.observation_space}")
-    
+
     # Apply frame stacking - same as in training
     env = VecFrameStack(env, n_stack=n_stack)
     print(f"Eval env - after VecFrameStack: {env.observation_space}")
-    
+
     # Apply custom transpose - same as in training
     env = CustomVecTranspose(env)
     print(f"Eval env - after CustomVecTranspose: {env.observation_space}")
-    
+
     return env
 
 
@@ -1046,23 +1121,25 @@ def create_eval_env_with_frame_stacking(n_stack=4, render_mode="human", debug=Fa
 class MemoryManagementCallback(BaseCallback):
     def __init__(self, verbose=0):
         super().__init__(verbose)
-        
+
     def _on_step(self) -> bool:
         # Run garbage collection when memory is low or every 50K steps
         import psutil
+
         memory_percent = psutil.virtual_memory().percent
         if memory_percent > 95 or self.num_timesteps % 50000 == 0:
             gc.collect()
             if th.cuda.is_available():
                 # Clear CUDA cache if using GPU
                 th.cuda.empty_cache()
-            
+
             # Log memory usage if verbose
             if self.verbose > 0:
                 import psutil
+
                 memory_usage = psutil.Process().memory_info().rss / (1024 * 1024)
                 print(f"Step {self.num_timesteps}: Memory usage: {memory_usage:.2f} MB")
-        
+
         return True
 
 
@@ -1153,24 +1230,25 @@ if __name__ == "__main__":
 
     # Create callback list to combine multiple callbacks
     from stable_baselines3.common.callbacks import CallbackList
+
     callback_list = CallbackList([checkpoint_callback, memory_callback])
 
     # Start training with proper checkpointing and memory management
     try:
-        if hasattr(th, 'set_num_threads'):
+        if hasattr(th, "set_num_threads"):
             num_threads = max(8, os.cpu_count() // 2)
             th.set_num_threads(num_threads)
             print(f"Setting PyTorch threads to {num_threads}")
-        
+
         # Configure PyTorch to release memory more aggressively
-        if hasattr(th.cuda, 'empty_cache'):
+        if hasattr(th.cuda, "empty_cache"):
             th.cuda.empty_cache()
-        
+
         model.learn(
             total_timesteps=remaining_timesteps,
             progress_bar=True,
             callback=callback_list,
-            tb_log_name=MODEL_TAG
+            tb_log_name=MODEL_TAG,
         )
     except KeyboardInterrupt:
         print("\nTraining interrupted. Saving final checkpoint...")
@@ -1178,8 +1256,10 @@ if __name__ == "__main__":
         gc.collect()
         if th.cuda.is_available():
             th.cuda.empty_cache()
-        
-        save_checkpoint(model, start_timestep + model.num_timesteps, model_tag=MODEL_TAG)
+
+        save_checkpoint(
+            model, start_timestep + model.num_timesteps, model_tag=MODEL_TAG
+        )
         print("Checkpoint saved. You can resume training later.")
 
     # Clean up memory before saving final model
@@ -1194,4 +1274,6 @@ if __name__ == "__main__":
     print("Model training complete!")
     print("To properly evaluate the model with human rendering, use:")
     print(f"python evaluate_model.py ppo_visual_attention_full_{timestamp}")
-    print("This will handle the observation stacking and preprocessing correctly for visual rendering.")
+    print(
+        "This will handle the observation stacking and preprocessing correctly for visual rendering."
+    )
