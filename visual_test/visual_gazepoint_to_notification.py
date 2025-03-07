@@ -43,6 +43,9 @@ AGENT_RADIUS = 10
 BLOCK_SIZE = 40
 MAX_MOVE_SPEED = 30  # Maximum speed for continuous actions
 MIN_MOVE_SPEED = 15  # Minimum speed for movement when action is non-zero
+MIN_BLOCK_GENERATION_DISTANCE = (
+    60  # Minimum distance between agent and target to generate a block
+)
 
 # Check if CUDA or MPS is available
 device = (
@@ -165,7 +168,11 @@ class VisualSimulationEnv(gym.Env):
             )
 
             # Make sure the target is not too close to the agent at initialization
-            if np.linalg.norm(self.agent_pos - self.target_pos) > 150:
+            # NOTE: beware if we scale down the screen size, this value needs to be scaled down as well
+            if (
+                np.linalg.norm(self.agent_pos - self.target_pos)
+                > MIN_BLOCK_GENERATION_DISTANCE
+            ):
                 break
 
     def _init_render(self):
