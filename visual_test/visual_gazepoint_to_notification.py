@@ -85,22 +85,22 @@ class VisualSimulationEnv(gym.Env):
 
         # --- ACTION SPACE ---
         # Changed from discrete to continuous action space
-        # Action is a 2D vector representing [x_direction, y_direction]
-        # Each value between -1 and 1, will be scaled by MAX_MOVE_SPEED
+        # Action is a 3D vector representing [x_direction, y_direction, layer]
+        # First two values between -1 and 1 for movement, last value between 0 and 1 for layer selection
+        # NOTE: The reason why the layer is not discrete is because the PPO do not support
+        #       spaces.Tuple, so we use continuous action space for layer selection
+        #       Then we use a threshold to convert the continuous action space to a discrete #       action space
         self.action_space = spaces.Box(
-            low=np.array([-1, -1], dtype=np.float32),
-            high=np.array([1, 1], dtype=np.float32),
-            shape=(2,),
+            low=np.array([-1, -1, 0], dtype=np.float32),
+            high=np.array([1, 1, 1], dtype=np.float32),
+            shape=(3,),
             dtype=np.float32,
         )
-        self.action_layer = spaces.Discrete(2)  # 0: environment, 1: notification
 
         # --- OBSERVATION SPACE ---
         # The observation is a dictionary containing both the visual observation and position information
         self.observation_space = spaces.Dict(
             {
-                # NOTE: We initialize with HWC format, which will be converted to CHW
-                # by the CustomVecTranspose wrapper
                 "visual": spaces.Box(
                     low=0,
                     high=255,
@@ -150,6 +150,12 @@ class VisualSimulationEnv(gym.Env):
         if self.render_mode == "human":
             self._init_render()
 
+        # Initialize observation buffers
+        self._obs_canvas = None
+        self._visual_obs_buffer = None
+        self._cached_target_boundaries = None
+
+        # Initialize state tracking variables
         self.reward = 0
         self.reward_count = 0
         self.exploration_count = 0  # Track how many exploration rewards/penalties given
@@ -214,12 +220,21 @@ class VisualSimulationEnv(gym.Env):
         self.clock = pygame.time.Clock()
 
     def reset(self, seed=None):
+        """Reset the environment to initial state.
+
+        Args:
+            seed: Random seed for reproducibility
+
+        Returns:
+            tuple: (observation, info)
+        """
         # We need the following line to seed self.np_random
         super().reset(seed=seed)
 
         # Reset positions
         self._initialize_positions()
 
+        # Reset state tracking variables
         self.reward = 0
         self._steps = 0
         self.exploration_count = 0
@@ -234,6 +249,7 @@ class VisualSimulationEnv(gym.Env):
         )
         self.oscillation_cooldown = 0
         self.visited_positions = set()
+        self.current_layer = LAYER_ENVIRONMENT
 
         # Update cached target boundaries for observation rendering
         if hasattr(self, "_cached_target_boundaries"):
@@ -336,7 +352,7 @@ class VisualSimulationEnv(gym.Env):
                 target_progress < TARGET_PROGRESS_THRESHOLD
                 and
                 # Agent is actively trying to move (non-zero action)
-                np.any(np.abs(action) > 0.2)
+                np.any(np.abs(action[:2]) > 0.2)
             )
 
             if local_minimum_detected:
@@ -429,14 +445,12 @@ class VisualSimulationEnv(gym.Env):
         self._steps += 1
         done = False
 
-        if isinstance(action, tuple) and len(action) == 2:
-            movement_action, layer_action = action
-        else:
-            movement_action = action
-            layer_action = None
+        # Extract movement and layer actions from the combined action vector
+        movement_action = action[:2]  # First two components for movement
+        layer_action = action[2]  # Last component for layer selection
 
-        if layer_action is not None:
-            self.current_layer = layer_action
+        # Convert layer_action from continuous [0,1] to discrete [0,1]
+        self.current_layer = int(layer_action > 0.5)  # Threshold at 0.5
 
         # Update movement action history
         self.action_history = np.roll(self.action_history, 1)
@@ -492,12 +506,19 @@ class VisualSimulationEnv(gym.Env):
 
         # Terminal reward for reaching target (only if on same layer)
         if self._check_collision(self.target_layer_block_size):
-            # if the agent is on the same layer as the target, give a big reward
+            # Only give reward if on the correct layer otherwise it will be punished
             if self.current_layer == self.target_layer:
-                reward += 200  # Big reward for reaching target
+                reward += 200
                 self.reward_count += 1
+            else:
+                reward -= 10
             if self.reward_count >= 3:
                 done = True
+        # else:
+        # NOTE: The current goal is to make the agent to stay on target layer
+        # However, sometimes the target layer is the environment layer, is this really match the real world?
+        #     if self.current_layer != LAYER_ENVIRONMENT:
+        #         reward -= 0.5
 
         # Reward for exploring (changing actions)
         if not self._detect_oscillation(movement_action):
@@ -527,7 +548,7 @@ class VisualSimulationEnv(gym.Env):
                     if direction_changed:
                         reward += 0.2
         else:
-            reward -= 0.5
+            reward -= 1
 
         # Reward for exploring new positions, use discretized position for our convience
         # Discretize position to track visited areas
@@ -538,7 +559,7 @@ class VisualSimulationEnv(gym.Env):
         if grid_pos not in self.visited_positions:
             self.visited_positions.add(grid_pos)
             # diminishing reward for finding new positions
-            reward += 0.5 * math.exp(len(self.visited_positions) * -0.05)
+            reward += 1 * math.exp(len(self.visited_positions) * -0.05)
 
         # Check if episode is done due to step limit
         if self._steps >= self._ep_length:
@@ -551,7 +572,7 @@ class VisualSimulationEnv(gym.Env):
 
     def _get_obs(self):
         # Create a canvas for the full screen observation or reuse existing one
-        if not hasattr(self, "_obs_canvas"):
+        if not hasattr(self, "_obs_canvas") or self._obs_canvas is None:
             self._obs_canvas = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
             self._visual_obs_buffer = np.empty(
                 (SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8
@@ -747,12 +768,23 @@ class VisualSimulationEnv(gym.Env):
         if hasattr(self, "_visual_obs_buffer"):
             del self._visual_obs_buffer
 
+        if hasattr(self, "_cached_target_boundaries"):
+            del self._cached_target_boundaries
+
         # Clear history collections
         if hasattr(self, "position_history"):
             self.position_history = []
 
         if hasattr(self, "target_distance_history"):
             self.target_distance_history = None
+
+        # Clear visited positions
+        if hasattr(self, "visited_positions"):
+            self.visited_positions.clear()
+
+        # Clear action history
+        if hasattr(self, "action_history"):
+            self.action_history = None
 
 
 class CoordConv(th.nn.Module):
@@ -1315,7 +1347,7 @@ if __name__ == "__main__":
     # Training parameters
     total_timesteps = 1000000
     check_freq = 50000  # Save checkpoint every 50k steps
-    MODEL_TAG = "PPO_Layer_Continuous"
+    MODEL_TAG = "PPO_Layer_shaping_Continuous"
 
     # Create environment with frame stacking
     n_stack = 4  # Stack 4 frames
