@@ -46,6 +46,11 @@ MIN_MOVE_SPEED = 5  # Minimum speed for movement when action is non-zero
 MIN_BLOCK_GENERATION_DISTANCE = (
     50  # Minimum distance between agent and target to generate a block
 )
+ENVIRONMENT_BLOCK_SIZE = 20  # Size of block when on environment layer
+NOTIFICATION_BLOCK_SIZE = 40  # Size of block when on notification layer
+
+LAYER_ENVIRONMENT = 0
+LAYER_NOTIFICATION = 1
 
 # Check if CUDA or MPS is available
 device = (
@@ -88,6 +93,7 @@ class VisualSimulationEnv(gym.Env):
             shape=(2,),
             dtype=np.float32,
         )
+        self.action_layer = spaces.Discrete(2)  # 0: environment, 1: notification
 
         # --- OBSERVATION SPACE ---
         # The observation is a dictionary containing both the visual observation and position information
@@ -117,6 +123,14 @@ class VisualSimulationEnv(gym.Env):
                 #     shape=(10,),
                 #     dtype=np.uint8,
                 # ),
+                "layer": spaces.Box(
+                    low=np.array([0], dtype=np.int8),  # Environment layer
+                    high=np.array([1], dtype=np.int8),  # Notification layer
+                    shape=(
+                        1,
+                    ),  # Layer information as a float (0: environment, 1: notification)
+                    dtype=np.int8,
+                ),
             }
         )
 
@@ -126,6 +140,9 @@ class VisualSimulationEnv(gym.Env):
 
         # Initialize positions of agent and target
         self._initialize_positions()
+
+        # Initialize layer state
+        self.current_layer = LAYER_ENVIRONMENT  # Note: this assumes that the agent starts on the environment layer
 
         # Initialize pygame if in human render mode
         self.screen = None
@@ -146,6 +163,8 @@ class VisualSimulationEnv(gym.Env):
             self.agent_pos - self.target_pos
         )
         self.oscillation_cooldown = 0
+        self.target_layer = None
+        self.target_layer_block_size = None
 
     def _initialize_positions(self):
         """Initialize agent and target positions"""
@@ -157,12 +176,25 @@ class VisualSimulationEnv(gym.Env):
             dtype=np.float32,
         )
 
+        self.target_layer = random.randint(0, 1)
+        self.target_layer_block_size = (
+            ENVIRONMENT_BLOCK_SIZE
+            if self.target_layer == LAYER_ENVIRONMENT
+            else NOTIFICATION_BLOCK_SIZE
+        )
+
         # Place the target at a random position, but ensure it's not right on top of the agent
         while True:
             self.target_pos = np.array(
                 [
-                    random.randint(BLOCK_SIZE // 2, SCREEN_WIDTH - BLOCK_SIZE // 2),
-                    random.randint(BLOCK_SIZE // 2, SCREEN_HEIGHT - BLOCK_SIZE // 2),
+                    random.randint(
+                        self.target_layer_block_size // 2,
+                        SCREEN_WIDTH - self.target_layer_block_size // 2,
+                    ),
+                    random.randint(
+                        self.target_layer_block_size // 2,
+                        SCREEN_HEIGHT - self.target_layer_block_size // 2,
+                    ),
                 ],
                 dtype=np.float32,
             )
@@ -205,7 +237,9 @@ class VisualSimulationEnv(gym.Env):
 
         # Update cached target boundaries for observation rendering
         if hasattr(self, "_cached_target_boundaries"):
-            self._cached_target_boundaries = self._get_target_boundaries()
+            self._cached_target_boundaries = self._get_target_boundaries(
+                self.target_layer_block_size
+            )
 
         # Process and handle events to avoid pygame becoming unresponsive
         if self.render_mode == "human":
@@ -215,19 +249,19 @@ class VisualSimulationEnv(gym.Env):
 
         return self._get_obs(), {}
 
-    def _get_target_boundaries(self):
+    def _get_target_boundaries(self, block_size):
         """
         Calculate the target boundaries
         Returns:
             tuple: (x_min, y_min, x_max, y_max) of target boundaries
         """
-        x_min = int(self.target_pos[0] - BLOCK_SIZE // 2)
-        y_min = int(self.target_pos[1] - BLOCK_SIZE // 2)
-        x_max = x_min + BLOCK_SIZE
-        y_max = y_min + BLOCK_SIZE
+        x_min = int(self.target_pos[0] - block_size // 2)
+        y_min = int(self.target_pos[1] - block_size // 2)
+        x_max = x_min + block_size
+        y_max = y_min + block_size
         return x_min, y_min, x_max, y_max
 
-    def _check_collision(self):
+    def _check_collision(self, block_size):
         """Check if the agent collides with the target"""
         # Calculate the center of the target
         target_center = self.target_pos
@@ -235,7 +269,7 @@ class VisualSimulationEnv(gym.Env):
         # Check if the distance between the agent's center and the target's center
         # is less than the sum of the agent's radius and half the target size
         distance = np.linalg.norm(self.agent_pos - target_center)
-        return distance < (AGENT_RADIUS + BLOCK_SIZE / 2)
+        return distance < (AGENT_RADIUS + block_size / 2)
 
     def _detect_oscillation(self, action):
         """
@@ -395,15 +429,24 @@ class VisualSimulationEnv(gym.Env):
         self._steps += 1
         done = False
 
-        # Update action history
+        if isinstance(action, tuple) and len(action) == 2:
+            movement_action, layer_action = action
+        else:
+            movement_action = action
+            layer_action = None
+
+        if layer_action is not None:
+            self.current_layer = layer_action
+
+        # Update movement action history
         self.action_history = np.roll(self.action_history, 1)
         self.action_history[0] = int(
-            np.argmax(np.abs(action))
+            np.argmax(np.abs(movement_action))
         )  # Store strongest direction for history
 
         # Normalize and scale the action vector
         # Actions are in range [-1, 1], scale them by MAX_MOVE_SPEED
-        action_vector = np.array(action, dtype=np.float32)
+        action_vector = np.array(movement_action, dtype=np.float32)
         vector_magnitude = np.linalg.norm(action_vector)
 
         # Normalize only if the magnitude is not zero to avoid division by zero
@@ -447,17 +490,17 @@ class VisualSimulationEnv(gym.Env):
         if hit_boundary:
             reward -= 10
 
-        # Terminal reward for reaching target
-        if self._check_collision():
-            reward += 200  # Big reward for reaching target
-            self.reward_count += 1
+        # Terminal reward for reaching target (only if on same layer)
+        if self._check_collision(self.target_layer_block_size):
+            # if the agent is on the same layer as the target, give a big reward
+            if self.current_layer == self.target_layer:
+                reward += 200  # Big reward for reaching target
+                self.reward_count += 1
             if self.reward_count >= 3:
                 done = True
 
         # Reward for exploring (changing actions)
-        # NOTE: disabled for now because its not working well on continuous actions
-        # Check for oscillation patterns in action history
-        if not self._detect_oscillation(action):
+        if not self._detect_oscillation(movement_action):
             if len(self.position_history) > 3:
                 recent_movement = self.agent_pos - self.position_history[0]
                 recent_movement_norm = np.linalg.norm(recent_movement)
@@ -510,11 +553,12 @@ class VisualSimulationEnv(gym.Env):
         # Create a canvas for the full screen observation or reuse existing one
         if not hasattr(self, "_obs_canvas"):
             self._obs_canvas = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
-
             self._visual_obs_buffer = np.empty(
                 (SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8
             )
-            self._cached_target_boundaries = self._get_target_boundaries()
+            self._cached_target_boundaries = self._get_target_boundaries(
+                self.target_layer_block_size
+            )
 
         # Reuse canvas to avoid memory allocation each time
         canvas = self._obs_canvas
@@ -523,7 +567,14 @@ class VisualSimulationEnv(gym.Env):
         # Draw the blue target block using cached boundaries
         target_x_min, target_y_min, _, _ = self._cached_target_boundaries
         pygame.draw.rect(
-            canvas, BLUE, (target_x_min, target_y_min, BLOCK_SIZE, BLOCK_SIZE)
+            canvas,
+            BLUE,
+            (
+                target_x_min,
+                target_y_min,
+                self.target_layer_block_size,
+                self.target_layer_block_size,
+            ),
         )
 
         # Draw the red agent
@@ -542,8 +593,9 @@ class VisualSimulationEnv(gym.Env):
         return {
             "visual": self._visual_obs_buffer,
             "position": self.agent_pos.astype(np.float32),
-            # "action_history": self.action_history,
-            # "target": self.target_pos.astype(np.float32)
+            "layer": np.array(
+                [self.current_layer], dtype=np.int8
+            ),  # Add current layer observation
         }
 
     def render(self, mode="human"):
@@ -582,9 +634,18 @@ class VisualSimulationEnv(gym.Env):
         self.screen.fill(WHITE)
 
         # Draw the blue target block
-        target_x_min, target_y_min, _, _ = self._get_target_boundaries()
+        target_x_min, target_y_min, _, _ = self._get_target_boundaries(
+            self.target_layer_block_size
+        )
         pygame.draw.rect(
-            self.screen, BLUE, (target_x_min, target_y_min, BLOCK_SIZE, BLOCK_SIZE)
+            self.screen,
+            BLUE,
+            (
+                target_x_min,
+                target_y_min,
+                self.target_layer_block_size,
+                self.target_layer_block_size,
+            ),
         )
 
         # Draw the red agent
@@ -609,6 +670,14 @@ class VisualSimulationEnv(gym.Env):
         reward = self.reward
         reward_text = font.render(f"Cumulative Reward: {reward:.2f}", True, BLACK)
         self.screen.blit(reward_text, (10, 50))
+
+        # Display current layer
+        layer_text = font.render(
+            f"Layer: {'Environment' if self.current_layer == LAYER_ENVIRONMENT else 'Notification'}",
+            True,
+            BLACK,
+        )
+        self.screen.blit(layer_text, (10, 70))
 
         # Display last four actions and exploration info
         action_names = {
@@ -646,7 +715,7 @@ class VisualSimulationEnv(gym.Env):
             True,
             BLACK,
         )
-        self.screen.blit(history_text, (10, 70))
+        self.screen.blit(history_text, (10, 90))
 
         # Display exploration count
         exploration_text = font.render(
@@ -654,7 +723,7 @@ class VisualSimulationEnv(gym.Env):
             True,
             BLACK,
         )
-        self.screen.blit(exploration_text, (10, 90))
+        self.screen.blit(exploration_text, (10, 110))
 
         # Return the screen as a numpy array if needed
         if self.render_mode == "rgb_array":
@@ -732,7 +801,7 @@ class CoordConv(th.nn.Module):
         )
 
         # Move to the same device as input
-        coords = th.cat([y_coords, x_coords], dim=1).to(x.device)
+        coords = th.cat([x_coords, y_coords], dim=1).to(x.device)
 
         # Add radial distance channel if requested
         if self.with_r:
@@ -803,7 +872,7 @@ class VisionExtractor(BaseFeaturesExtractor):
             CoordConv(
                 # th.nn.Conv2d(
                 n_input_channels,
-                out_channels=8,
+                output_channels=8,
                 kernel_size=(3, 3),
                 stride=(2, 2),
                 padding=(1, 1),
@@ -1002,9 +1071,9 @@ class CustomVecTranspose(VecTransposeImage):
                 "position": venv.observation_space[
                     "position"
                 ],  # Keep position space as is
-                # "action_history": spaces.Box(
-                #     low=0, high=255, shape=(10,), dtype=np.uint8
-                # ),
+                "layer": venv.observation_space[
+                    "layer"
+                ],  # Keep layer space as is (already stacked)
             }
         )
 
@@ -1018,12 +1087,14 @@ class CustomVecTranspose(VecTransposeImage):
             # For single observations (e.g., during evaluation)
             visual_obs = obs["visual"]  # Shape: (H, W, C)
             position = obs["position"]  # Shape: (2,)
+            layer = obs["layer"]  # Shape: (n_stack,)
         else:
             # For vectorized observations (e.g., from DummyVecEnv)
             # This is the most common case during training
             visual_obs = obs[0]["visual"]  # Shape: (H, W, C) or (1, H, W, C)
             position = obs[0]["position"]  # Shape: (2,) or (1, 2)
             # action_history = obs[0]["action_history"]  # Shape: (10,) or (1, 10)
+            layer = obs[0]["layer"]  # Shape: (n_stack,) or (1, n_stack)
 
         # Single fast check for both visual and position to remove batch dim
         # Remove any extra batch dimension from DummyVecEnv if present
@@ -1032,6 +1103,12 @@ class CustomVecTranspose(VecTransposeImage):
 
         if isinstance(position, np.ndarray) and len(position.shape) == 2:
             position = position[0]  # Convert (1, 2) to (2,)
+
+        if isinstance(layer, np.ndarray):
+            if len(layer.shape) > 1:
+                layer = layer[0]  # Convert (1, n_stack) to (n_stack,)
+            if len(layer.shape) == 0:
+                layer = layer.reshape(1)  # Ensure shape is (1,)
 
         # Convert from HWC to CHW format - only once and only if needed
         # Check if already in CHW format to avoid unnecessary transpose
@@ -1066,6 +1143,7 @@ class CustomVecTranspose(VecTransposeImage):
             "visual": visual_result,
             "position": position,
             # "action_history": action_history,
+            "layer": layer,
         }
 
 
@@ -1237,7 +1315,7 @@ if __name__ == "__main__":
     # Training parameters
     total_timesteps = 1000000
     check_freq = 50000  # Save checkpoint every 50k steps
-    MODEL_TAG = "PPO_Res200_CoordConv_FrameStack4_KL_0.1_Continuous"
+    MODEL_TAG = "PPO_Layer_Continuous"
 
     # Create environment with frame stacking
     n_stack = 4  # Stack 4 frames
