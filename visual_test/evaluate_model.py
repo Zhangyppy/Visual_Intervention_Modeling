@@ -49,7 +49,7 @@ def manual_evaluate(model, env, n_episodes=10):
         # Initialize frame stacking with duplicate frames
         frames_history = [obs["visual"]] * STACKED_FRAMES
         positions_history = [obs["position"]] * STACKED_FRAMES
-        layers_history = [obs["layer"]] * STACKED_FRAMES
+        layers_history = [obs["current_layer"]] * STACKED_FRAMES
 
         while not (done or truncated) and step_count < 100:
             try:
@@ -74,7 +74,7 @@ def manual_evaluate(model, env, n_episodes=10):
                 stacked_obs = {
                     "visual": stacked_visual,
                     "position": stacked_position,
-                    "layer": stacked_layers,
+                    "current_layer": stacked_layers,
                 }
 
                 # Get and convert action
@@ -101,7 +101,7 @@ def manual_evaluate(model, env, n_episodes=10):
                 positions_history.pop(0)
                 positions_history.append(next_obs["position"])
                 layers_history.pop(0)
-                layers_history.append(next_obs["layer"])
+                layers_history.append(next_obs["current_layer"])
 
                 # Render and add delay for visibility
                 env.render()

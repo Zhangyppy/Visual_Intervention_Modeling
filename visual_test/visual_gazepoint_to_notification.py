@@ -123,12 +123,18 @@ class VisualSimulationEnv(gym.Env):
                 #     shape=(10,),
                 #     dtype=np.uint8,
                 # ),
-                "layer": spaces.Box(
+                "current_layer": spaces.Box(
                     low=np.array([0], dtype=np.int8),  # Environment layer
                     high=np.array([1], dtype=np.int8),  # Notification layer
                     shape=(
                         1,
                     ),  # Layer information as a float (0: environment, 1: notification)
+                    dtype=np.int8,
+                ),
+                "target_layer": spaces.Box(
+                    low=np.array([0], dtype=np.int8),
+                    high=np.array([1], dtype=np.int8),
+                    shape=(1,),
                     dtype=np.int8,
                 ),
             }
@@ -153,7 +159,6 @@ class VisualSimulationEnv(gym.Env):
         # Initialize observation buffers
         self._obs_canvas = None
         self._visual_obs_buffer = None
-        self._cached_target_boundaries = None
 
         # Initialize state tracking variables
         self.reward = 0
@@ -250,12 +255,6 @@ class VisualSimulationEnv(gym.Env):
         self.oscillation_cooldown = 0
         self.visited_positions = set()
         self.current_layer = LAYER_ENVIRONMENT
-
-        # Update cached target boundaries for observation rendering
-        if hasattr(self, "_cached_target_boundaries"):
-            self._cached_target_boundaries = self._get_target_boundaries(
-                self.target_layer_block_size
-            )
 
         # Process and handle events to avoid pygame becoming unresponsive
         if self.render_mode == "human":
@@ -449,6 +448,7 @@ class VisualSimulationEnv(gym.Env):
         movement_action = action[:2]  # First two components for movement
         layer_action = action[2]  # Last component for layer selection
 
+        prev_layer = self.current_layer
         # Convert layer_action from continuous [0,1] to discrete [0,1]
         self.current_layer = int(layer_action > 0.5)  # Threshold at 0.5
 
@@ -511,7 +511,7 @@ class VisualSimulationEnv(gym.Env):
                 reward += 200
                 self.reward_count += 1
             else:
-                reward -= 10
+                reward -= 5
             if self.reward_count >= 3:
                 done = True
         # else:
@@ -520,35 +520,35 @@ class VisualSimulationEnv(gym.Env):
         #     if self.current_layer != LAYER_ENVIRONMENT:
         #         reward -= 0.5
 
-        # Reward for exploring (changing actions)
-        if not self._detect_oscillation(movement_action):
-            if len(self.position_history) > 3:
-                recent_movement = self.agent_pos - self.position_history[0]
-                recent_movement_norm = np.linalg.norm(recent_movement)
+        # # Reward for exploring (changing actions)
+        # if not self._detect_oscillation(movement_action):
+        #     if len(self.position_history) > 3:
+        #         recent_movement = self.agent_pos - self.position_history[0]
+        #         recent_movement_norm = np.linalg.norm(recent_movement)
 
-                if recent_movement_norm > MIN_MOVE_SPEED:
-                    # Normalize the movement vector (only once)
-                    recent_dir = recent_movement / recent_movement_norm
+        #         if recent_movement_norm > MIN_MOVE_SPEED:
+        #             # Normalize the movement vector (only once)
+        #             recent_dir = recent_movement / recent_movement_norm
 
-                    # Check if the direction has changed
-                    direction_changed = False
-                    for i in range(1, min(3, len(self.position_history) - 1)):
-                        prev_movement = (
-                            self.position_history[i - 1] - self.position_history[i]
-                        )
-                        prev_movement_norm = np.linalg.norm(prev_movement)
+        #             # Check if the direction has changed
+        #             direction_changed = False
+        #             for i in range(1, min(3, len(self.position_history) - 1)):
+        #                 prev_movement = (
+        #                     self.position_history[i - 1] - self.position_history[i]
+        #                 )
+        #                 prev_movement_norm = np.linalg.norm(prev_movement)
 
-                        if prev_movement_norm > MIN_MOVE_SPEED:
-                            prev_dir = prev_movement / prev_movement_norm
-                            # If dot product is less than threshold, directions are different
-                            if np.dot(recent_dir, prev_dir) < 0.8:  # Not too similar
-                                direction_changed = True
-                                break
+        #                 if prev_movement_norm > MIN_MOVE_SPEED:
+        #                     prev_dir = prev_movement / prev_movement_norm
+        #                     # If dot product is less than threshold, directions are different
+        #                     if np.dot(recent_dir, prev_dir) < 0.8:  # Not too similar
+        #                         direction_changed = True
+        #                         break
 
-                    if direction_changed:
-                        reward += 0.2
-        else:
-            reward -= 1
+        #             if direction_changed:
+        #                 reward += 0.2
+        # else:
+        #     reward -= 1
 
         # Reward for exploring new positions, use discretized position for our convience
         # Discretize position to track visited areas
@@ -560,6 +560,9 @@ class VisualSimulationEnv(gym.Env):
             self.visited_positions.add(grid_pos)
             # diminishing reward for finding new positions
             reward += 1 * math.exp(len(self.visited_positions) * -0.05)
+
+        if prev_layer != self.current_layer:
+            reward -= 0.2
 
         # Check if episode is done due to step limit
         if self._steps >= self._ep_length:
@@ -577,16 +580,15 @@ class VisualSimulationEnv(gym.Env):
             self._visual_obs_buffer = np.empty(
                 (SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8
             )
-            self._cached_target_boundaries = self._get_target_boundaries(
-                self.target_layer_block_size
-            )
 
         # Reuse canvas to avoid memory allocation each time
         canvas = self._obs_canvas
         canvas.fill(WHITE)
 
-        # Draw the blue target block using cached boundaries
-        target_x_min, target_y_min, _, _ = self._cached_target_boundaries
+        # Draw the blue target block
+        target_x_min, target_y_min, _, _ = self._get_target_boundaries(
+            self.target_layer_block_size
+        )
         pygame.draw.rect(
             canvas,
             BLUE,
@@ -614,9 +616,8 @@ class VisualSimulationEnv(gym.Env):
         return {
             "visual": self._visual_obs_buffer,
             "position": self.agent_pos.astype(np.float32),
-            "layer": np.array(
-                [self.current_layer], dtype=np.int8
-            ),  # Add current layer observation
+            "current_layer": np.array([self.current_layer], dtype=np.int8),
+            "target_layer": np.array([self.target_layer], dtype=np.int8),
         }
 
     def render(self, mode="human"):
@@ -768,9 +769,6 @@ class VisualSimulationEnv(gym.Env):
         if hasattr(self, "_visual_obs_buffer"):
             del self._visual_obs_buffer
 
-        if hasattr(self, "_cached_target_boundaries"):
-            del self._cached_target_boundaries
-
         # Clear history collections
         if hasattr(self, "position_history"):
             self.position_history = []
@@ -854,6 +852,7 @@ class VisionExtractor(BaseFeaturesExtractor):
         features_dim: int = 256,
         input_channels=None,
         resize_to=None,
+        n_stack=1,
     ):
         # Initialize with the visual part of the observation space
         super().__init__(observation_space, features_dim)
@@ -883,6 +882,7 @@ class VisionExtractor(BaseFeaturesExtractor):
                 n_input_channels = visual_space.shape[2]
 
         pos_dim = observation_space["position"].shape[0]
+        layer_dim = observation_space["current_layer"].shape[0]
         # action_history_dim = observation_space["action_history"].shape[0]
 
         print(f"Initializing CNN with {n_input_channels} input channels")
@@ -969,8 +969,28 @@ class VisionExtractor(BaseFeaturesExtractor):
             n_flatten = self.cnn(resized_sample).shape[1]
             print(f"Flattened features size: {n_flatten}")
 
-        # Create a network for processing position data
-        self.pos_net = th.nn.Sequential(th.nn.Linear(pos_dim, 64), th.nn.ReLU())
+        # Create a network for processing position data (with frame stacking)
+        self.pos_net = th.nn.Sequential(
+            th.nn.Linear(pos_dim, 64),
+            th.nn.ReLU(),
+            th.nn.Linear(64, 32),
+            th.nn.ReLU(),
+        )
+
+        # Create a network for processing layer data (binary input with frame stacking)
+        self.curr_layer_net = th.nn.Sequential(
+            th.nn.Linear(layer_dim, 32),
+            th.nn.ReLU(),
+            th.nn.Linear(32, 16),
+            th.nn.ReLU(),
+        )
+
+        self.target_layer_net = th.nn.Sequential(
+            th.nn.Linear(layer_dim, 32),
+            th.nn.ReLU(),
+            th.nn.Linear(32, 16),
+            th.nn.ReLU(),
+        )
 
         # Create a network for processing action history
         # self.action_history_net = th.nn.Sequential(
@@ -986,7 +1006,9 @@ class VisionExtractor(BaseFeaturesExtractor):
             # th.nn.Linear(n_flatten + 64, features_dim),
             # th.nn.LayerNorm(features_dim),
             # th.nn.ReLU(),
-            th.nn.Linear(n_flatten + 64, features_dim),
+            th.nn.Linear(
+                n_flatten + 32 + 16 + 16, features_dim
+            ),  # 32 for position features, 16 for layer features
             th.nn.ReLU(),
         )
 
@@ -1059,15 +1081,57 @@ class VisionExtractor(BaseFeaturesExtractor):
         # Process action history features
         # action_history_obs = th.as_tensor(observations["action_history"]).float()
 
+        # Process layer features
+        if isinstance(observations["current_layer"], th.Tensor):
+            curr_layer_obs = observations["current_layer"]
+            if curr_layer_obs.dtype != th.float32:
+                curr_layer_obs = curr_layer_obs.to(dtype=th.float32, non_blocking=True)
+        else:
+            if th.cuda.is_available():
+                curr_layer_obs = th.as_tensor(
+                    observations["current_layer"], dtype=th.float32, device="cuda"
+                )
+            else:
+                curr_layer_obs = th.as_tensor(
+                    observations["current_layer"], dtype=th.float32
+                )
+
+        if isinstance(observations["target_layer"], th.Tensor):
+            target_layer_obs = observations["target_layer"]
+            if target_layer_obs.dtype != th.float32:
+                target_layer_obs = target_layer_obs.to(
+                    dtype=th.float32, non_blocking=True
+                )
+        else:
+            target_layer_obs = th.as_tensor(
+                observations["target_layer"], dtype=th.float32
+            )
+
         # Add batch dimension if needed
         # if action_history_obs.dim() == 1:
         #     action_history_obs = action_history_obs.unsqueeze(0)
         # action_history_features = self.action_history_net(action_history_obs)
 
-        # Combine features
-        # combined = th.cat([visual_features, pos_features], dim=1)
+        if curr_layer_obs.dim() == 1:
+            curr_layer_obs = curr_layer_obs.unsqueeze(0)  # (1,) -> (1,1
+        curr_layer_features = self.curr_layer_net(curr_layer_obs)
 
-        return self.combined(th.cat([visual_features, pos_features], dim=1))
+        if target_layer_obs.dim() == 1:
+            target_layer_obs = target_layer_obs.unsqueeze(0)  # (1,) -> (1,1
+        target_layer_features = self.target_layer_net(target_layer_obs)
+
+        # Combine all features
+        return self.combined(
+            th.cat(
+                [
+                    visual_features,
+                    pos_features,
+                    curr_layer_features,
+                    target_layer_features,
+                ],
+                dim=1,
+            )
+        )
 
 
 class CustomVecTranspose(VecTransposeImage):
@@ -1103,8 +1167,11 @@ class CustomVecTranspose(VecTransposeImage):
                 "position": venv.observation_space[
                     "position"
                 ],  # Keep position space as is
-                "layer": venv.observation_space[
-                    "layer"
+                "current_layer": venv.observation_space[
+                    "current_layer"
+                ],  # Keep layer space as is (already stacked)
+                "target_layer": venv.observation_space[
+                    "target_layer"
                 ],  # Keep layer space as is (already stacked)
             }
         )
@@ -1119,14 +1186,16 @@ class CustomVecTranspose(VecTransposeImage):
             # For single observations (e.g., during evaluation)
             visual_obs = obs["visual"]  # Shape: (H, W, C)
             position = obs["position"]  # Shape: (2,)
-            layer = obs["layer"]  # Shape: (n_stack,)
+            curr_layer = obs["current_layer"]  # Shape: (n_stack,)
+            target_layer = obs["target_layer"]  # Shape: (n_stack,)
         else:
             # For vectorized observations (e.g., from DummyVecEnv)
             # This is the most common case during training
             visual_obs = obs[0]["visual"]  # Shape: (H, W, C) or (1, H, W, C)
             position = obs[0]["position"]  # Shape: (2,) or (1, 2)
             # action_history = obs[0]["action_history"]  # Shape: (10,) or (1, 10)
-            layer = obs[0]["layer"]  # Shape: (n_stack,) or (1, n_stack)
+            curr_layer = obs[0]["current_layer"]  # Shape: (n_stack,) or (1, n_stack)
+            target_layer = obs[0]["target_layer"]  # Shape: (n_stack,) or (1, n_stack)
 
         # Single fast check for both visual and position to remove batch dim
         # Remove any extra batch dimension from DummyVecEnv if present
@@ -1136,11 +1205,17 @@ class CustomVecTranspose(VecTransposeImage):
         if isinstance(position, np.ndarray) and len(position.shape) == 2:
             position = position[0]  # Convert (1, 2) to (2,)
 
-        if isinstance(layer, np.ndarray):
-            if len(layer.shape) > 1:
-                layer = layer[0]  # Convert (1, n_stack) to (n_stack,)
-            if len(layer.shape) == 0:
-                layer = layer.reshape(1)  # Ensure shape is (1,)
+        if isinstance(curr_layer, np.ndarray):
+            if len(curr_layer.shape) > 1:
+                curr_layer = curr_layer[0]  # Convert (1, n_stack) to (n_stack,)
+            if len(curr_layer.shape) == 0:
+                curr_layer = curr_layer.reshape(1)  # Ensure shape is (1,)
+
+        if isinstance(target_layer, np.ndarray):
+            if len(target_layer.shape) > 1:
+                target_layer = target_layer[0]  # Convert (1, n_stack) to (n_stack,)
+            if len(target_layer.shape) == 0:
+                target_layer = target_layer.reshape(1)  # Ensure shape is (1,)
 
         # Convert from HWC to CHW format - only once and only if needed
         # Check if already in CHW format to avoid unnecessary transpose
@@ -1150,7 +1225,6 @@ class CustomVecTranspose(VecTransposeImage):
             and visual_obs.shape[2] <= 12
         ):
             # Standard case - needs transpose
-
             h, w, c = visual_obs.shape
 
             # Create or resize transpose buffer if needed
@@ -1175,7 +1249,8 @@ class CustomVecTranspose(VecTransposeImage):
             "visual": visual_result,
             "position": position,
             # "action_history": action_history,
-            "layer": layer,
+            "current_layer": curr_layer,
+            "target_layer": target_layer,
         }
 
 
@@ -1347,7 +1422,7 @@ if __name__ == "__main__":
     # Training parameters
     total_timesteps = 1000000
     check_freq = 50000  # Save checkpoint every 50k steps
-    MODEL_TAG = "PPO_Layer_shaping_Continuous"
+    MODEL_TAG = "PPO_Layer_target_layer_nn_Continuous"
 
     # Create environment with frame stacking
     n_stack = 4  # Stack 4 frames
@@ -1362,6 +1437,7 @@ if __name__ == "__main__":
             input_channels=input_channels,
             # Downscale the visual input to this size (height, width)
             # resize_to=(84, 84)
+            n_stack=n_stack,
         ),
         # Use a larger network to process the stacked frames
         net_arch=[256, 128, 64],
@@ -1376,7 +1452,7 @@ if __name__ == "__main__":
         learning_rate=3e-4,
         n_steps=2048,
         batch_size=512,
-        ent_coef=0.001,
+        ent_coef=0.005,
         tensorboard_log=os.path.join("Training", "Logs"),
         device=device,
         target_kl=0.1,
