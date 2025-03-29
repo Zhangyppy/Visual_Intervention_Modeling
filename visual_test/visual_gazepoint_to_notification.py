@@ -11,6 +11,7 @@ import random
 import os
 import torch as th
 from cbam import CBAM
+from target import Target, LAYER_ENVIRONMENT, LAYER_NOTIFICATION
 
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.monitor import Monitor
@@ -177,11 +178,9 @@ class VisualSimulationEnv(gym.Env):
         self.position_history = [self.agent_pos.copy()]
         self.target_distance_history = np.zeros(10, dtype=np.float32)
         self.target_distance_history[0] = np.linalg.norm(
-            self.agent_pos - self.target_pos
+            self.agent_pos - self.target.pos
         )
         self.oscillation_cooldown = 0
-        self.target_layer = None
-        self.target_layer_block_size = None
 
     def _initialize_positions(self):
         """Initialize agent and target positions"""
@@ -193,24 +192,17 @@ class VisualSimulationEnv(gym.Env):
             dtype=np.float32,
         )
 
-        self.target_layer = random.randint(0, 1)
-        self.target_layer_block_size = (
-            ENVIRONMENT_BLOCK_SIZE
-            if self.target_layer == LAYER_ENVIRONMENT
-            else NOTIFICATION_BLOCK_SIZE
-        )
-
         # Place the target at a random position, but ensure it's not right on top of the agent
         while True:
-            self.target_pos = np.array(
+            target_pos = np.array(
                 [
                     random.randint(
-                        self.target_layer_block_size // 2,
-                        SCREEN_WIDTH - self.target_layer_block_size // 2,
+                        NOTIFICATION_BLOCK_SIZE // 2,
+                        SCREEN_WIDTH - NOTIFICATION_BLOCK_SIZE // 2,
                     ),
                     random.randint(
-                        self.target_layer_block_size // 2,
-                        SCREEN_HEIGHT - self.target_layer_block_size // 2,
+                        NOTIFICATION_BLOCK_SIZE // 2,
+                        SCREEN_HEIGHT - NOTIFICATION_BLOCK_SIZE // 2,
                     ),
                 ],
                 dtype=np.float32,
@@ -218,11 +210,14 @@ class VisualSimulationEnv(gym.Env):
 
             # Make sure the target is not too close to the agent at initialization
             # NOTE: beware if we scale down the screen size, this value needs to be scaled down as well
-            if (
-                np.linalg.norm(self.agent_pos - self.target_pos)
-                > MIN_BLOCK_GENERATION_DISTANCE
-            ):
+            if np.linalg.norm(self.agent_pos - target_pos) > MIN_BLOCK_GENERATION_DISTANCE:
                 break
+                
+        # Create the target with default settings (random layer)
+        self.target = Target(
+            pos=target_pos,
+            required_steps=3
+        )
 
     def _init_render(self):
         pygame.init()
@@ -256,7 +251,7 @@ class VisualSimulationEnv(gym.Env):
         self.position_history = [self.agent_pos.copy()]
         self.target_distance_history = np.zeros(10, dtype=np.float32)
         self.target_distance_history[0] = np.linalg.norm(
-            self.agent_pos - self.target_pos
+            self.agent_pos - self.target.pos
         )
         self.oscillation_cooldown = 0
         self.visited_positions = set()
@@ -270,27 +265,9 @@ class VisualSimulationEnv(gym.Env):
 
         return self._get_obs(), {}
 
-    def _get_target_boundaries(self, block_size):
-        """
-        Calculate the target boundaries
-        Returns:
-            tuple: (x_min, y_min, x_max, y_max) of target boundaries
-        """
-        x_min = int(self.target_pos[0] - block_size // 2)
-        y_min = int(self.target_pos[1] - block_size // 2)
-        x_max = x_min + block_size
-        y_max = y_min + block_size
-        return x_min, y_min, x_max, y_max
-
-    def _check_collision(self, block_size):
+    def _check_collision(self):
         """Check if the agent collides with the target"""
-        # Calculate the center of the target
-        target_center = self.target_pos
-
-        # Check if the distance between the agent's center and the target's center
-        # is less than the sum of the agent's radius and half the target size
-        distance = np.linalg.norm(self.agent_pos - target_center)
-        return distance < (AGENT_RADIUS + block_size / 2)
+        return self.target.check_collision(self.agent_pos, AGENT_RADIUS)
 
     def _detect_oscillation(self, action):
         """
@@ -313,7 +290,7 @@ class VisualSimulationEnv(gym.Env):
             self.oscillation_cooldown = 0
 
         # Update distance to target history
-        current_target_distance = np.linalg.norm(self.agent_pos - self.target_pos)
+        current_target_distance = np.linalg.norm(self.agent_pos - self.target.pos)
 
         if not hasattr(self, "target_distance_history"):
             self.target_distance_history = np.zeros(HISTORY_LENGTH, dtype=np.float32)
@@ -511,13 +488,24 @@ class VisualSimulationEnv(gym.Env):
         #     reward -= 10
 
         # Terminal reward for reaching target (only if on same layer)
-        if self._check_collision(self.target_layer_block_size):
-            # Only give reward if on the correct layer otherwise it will be punished
-            if self.current_layer == self.target_layer:
-                reward += 200
-                self.reward_count += 1
+        if self._check_collision():
+            # Check if agent is on the correct layer
+            agent_on_correct_layer = self.current_layer == self.target.layer
+            target_completed = self.target.update_progress(True, agent_on_correct_layer)
+            
+            if agent_on_correct_layer:
+                # Give immediate reward for being on correct target and layer
+                reward += 50
+                
+                # Give bonus reward if target is completed
+                if target_completed:
+                    reward += 150
+                    self.reward_count += 1
             else:
+                # Penalty for being on wrong layer
                 reward -= 10
+                
+            # Check if episode is done based on reward count
             if self.reward_count >= 3:
                 done = True
         # else:
@@ -555,6 +543,9 @@ class VisualSimulationEnv(gym.Env):
         #                 reward += 0.2
         # else:
         #     reward -= 1
+        else:
+            # Update target progress (not on target)
+            self.target.update_progress(False, False)
 
         # Reward for exploring new positions, use discretized position for our convience
         # Discretize position to track visited areas
@@ -566,9 +557,6 @@ class VisualSimulationEnv(gym.Env):
             self.visited_positions.add(grid_pos)
             # diminishing reward for finding new positions
             reward += 1 * math.exp(len(self.visited_positions) * -0.05)
-
-        # if prev_layer != self.current_layer:
-        #     reward -= 0.2
 
         # Check if episode is done due to step limit
         if self._steps >= self._ep_length:
@@ -592,49 +580,47 @@ class VisualSimulationEnv(gym.Env):
         canvas.fill(WHITE)
 
         # Draw the target block
-        target_x_min, target_y_min, _, _ = self._get_target_boundaries(
-            self.target_layer_block_size
-        )
+        target_x_min, target_y_min, _, _ = self.target.get_boundaries()
         pygame.draw.rect(
             canvas,
-            BLUE,
+            self.target.color,
             (
                 target_x_min,
                 target_y_min,
-                self.target_layer_block_size,
-                self.target_layer_block_size,
+                self.target.size,
+                self.target.size,
             ),
         )
 
         # add texture to the target block
-        if self.target_layer == LAYER_ENVIRONMENT:
+        if self.target.layer == LAYER_ENVIRONMENT:
             # for environment layer: add small horizontal lines inside the block
-            line_spacing = self.target_layer_block_size // 4
+            line_spacing = self.target.size // 4
             for i in range(1, 4):
                 pygame.draw.line(
                     canvas,
-                    GREEN_TEXTURE,
+                    self.target.texture,
                     (target_x_min, target_y_min + i * line_spacing),
                     (
-                        target_x_min + self.target_layer_block_size,
+                        target_x_min + self.target.size,
                         target_y_min + i * line_spacing,
                     ),
                     1,
                 )
-            else:  # LAYER_NOTIFICATION
-                # for notification layer: add small vertical lines inside the block
-                line_spacing = self.target_layer_block_size // 4
-                for i in range(1, 4):
-                    pygame.draw.line(
-                        canvas,
-                        BLUE_TEXTURE,
-                        (target_x_min + i * line_spacing, target_y_min),
-                        (
-                            target_x_min + i * line_spacing,
-                            target_y_min + self.target_layer_block_size,
-                        ),
-                        1,  # Thin line
-                    )
+        else:  # LAYER_NOTIFICATION
+            # for notification layer: add small vertical lines inside the block
+            line_spacing = self.target.size // 4
+            for i in range(1, 4):
+                pygame.draw.line(
+                    canvas,
+                    self.target.texture,
+                    (target_x_min + i * line_spacing, target_y_min),
+                    (
+                        target_x_min + i * line_spacing,
+                        target_y_min + self.target.size,
+                    ),
+                    1,  # Thin line
+                )
 
         # Draw the red agent
         pygame.draw.circle(canvas, RED, self.agent_pos.astype(int), AGENT_RADIUS)
@@ -653,7 +639,7 @@ class VisualSimulationEnv(gym.Env):
             "visual": self._visual_obs_buffer,
             "position": self.agent_pos.astype(np.float32),
             "current_layer": np.array([self.current_layer], dtype=np.int8),
-            "target_layer": np.array([self.target_layer], dtype=np.int8),
+            "target_layer": np.array([self.target.layer], dtype=np.int8),
         }
 
     def render(self, mode="human"):
@@ -691,25 +677,42 @@ class VisualSimulationEnv(gym.Env):
         # Fill the background
         self.screen.fill(WHITE)
 
-        # Draw the blue target block
-        target_x_min, target_y_min, _, _ = self._get_target_boundaries(
-            self.target_layer_block_size
-        )
-        target_color = (
-            NOTIFICATION_COLORS
-            if self.target_layer == LAYER_NOTIFICATION
-            else ENVIRONMENT_COLORS
-        )
+        # Draw the target block
+        target_x_min, target_y_min, _, _ = self.target.get_boundaries()
         pygame.draw.rect(
             self.screen,
-            target_color,
+            self.target.color,
             (
                 target_x_min,
                 target_y_min,
-                self.target_layer_block_size,
-                self.target_layer_block_size,
+                self.target.size,
+                self.target.size,
             ),
         )
+        
+        # Add texture to the target
+        if self.target.layer == LAYER_ENVIRONMENT:
+            # Horizontal lines for environment targets
+            line_spacing = self.target.size // 4
+            for i in range(1, 4):
+                pygame.draw.line(
+                    self.screen,
+                    self.target.texture,
+                    (target_x_min, target_y_min + i * line_spacing),
+                    (target_x_min + self.target.size, target_y_min + i * line_spacing),
+                    1,
+                )
+        else:
+            # Vertical lines for notification targets
+            line_spacing = self.target.size // 4
+            for i in range(1, 4):
+                pygame.draw.line(
+                    self.screen,
+                    self.target.texture,
+                    (target_x_min + i * line_spacing, target_y_min),
+                    (target_x_min + i * line_spacing, target_y_min + self.target.size),
+                    1,
+                )
 
         # Draw the red agent
         pygame.draw.circle(self.screen, RED, self.agent_pos.astype(int), AGENT_RADIUS)
@@ -717,80 +720,90 @@ class VisualSimulationEnv(gym.Env):
         # draw the space boundaries outer boundary
         pygame.draw.rect(self.screen, BLACK, (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT), 5)
 
-        # Draw text info
-        font = pygame.font.SysFont("Arial", 14)
-
-        # Display step count
-        steps_text = font.render(f"Steps: {self._steps}/{self._ep_length}", True, BLACK)
-        self.screen.blit(steps_text, (10, 10))
-
-        # Display distance
-        distance = np.linalg.norm(self.agent_pos - self.target_pos)
-        distance_text = font.render(f"Distance: {distance:.1f}", True, BLACK)
-        self.screen.blit(distance_text, (10, 30))
-
-        # Display reward
-        reward = self.reward
-        reward_text = font.render(f"Cumulative Reward: {reward:.2f}", True, BLACK)
-        self.screen.blit(reward_text, (10, 50))
-
-        # Display current layer
-        layer_text = font.render(
-            f"Layer: {'Environment' if self.current_layer == LAYER_ENVIRONMENT else 'Notification'}",
-            True,
-            BLACK,
-        )
-        self.screen.blit(layer_text, (10, 70))
-
-        # Display last four actions and exploration info
-        action_names = {
-            0: "Up",
-            1: "Right",
-            2: "Down",
-            3: "Left",
-            None: "None",
-            255: "None",
-        }
-
-        # Get the last 4 actions from action history if available
-        action_history = []
-        if hasattr(self, "action_history"):
-            action_history = (
-                self.action_history[-4:] if len(self.action_history) > 0 else []
-            )
-        else:
-            # Fallback to last and second last if action_history not available
-            if hasattr(self, "last_action"):
-                action_history.append(self.last_action)
-            if hasattr(self, "second_last_action"):
-                action_history.insert(0, self.second_last_action)
-
-        # Pad with None if we have fewer than 4 actions
-        while len(action_history) < 4:
-            action_history.insert(0, None)
-
-        # Convert to action names
-        action_history_names = [action_names.get(a, str(a)) for a in action_history]
-
-        # Display the action history
-        history_text = font.render(
-            f"Recent actions: {' → '.join(action_history_names)}",
-            True,
-            BLACK,
-        )
-        self.screen.blit(history_text, (10, 90))
-
-        # Display exploration count
-        exploration_text = font.render(
-            f"Explored: {self.exploration_count}",
-            True,
-            BLACK,
-        )
-        self.screen.blit(exploration_text, (10, 110))
-
         # Return the screen as a numpy array if needed
         if self.render_mode == "rgb_array":
             return pygame.surfarray.array3d(self.screen).transpose(1, 0, 2)
+
+        # Draw text info only in human render mode
+        if self.render_mode == "human":
+            font = pygame.font.SysFont("Arial", 14)
+
+            # Display step count
+            steps_text = font.render(f"Steps: {self._steps}/{self._ep_length}", True, BLACK)
+            self.screen.blit(steps_text, (10, 10))
+
+            # Display distance
+            distance = np.linalg.norm(self.agent_pos - self.target.pos)
+            distance_text = font.render(f"Distance: {distance:.1f}", True, BLACK)
+            self.screen.blit(distance_text, (10, 30))
+
+            # Display reward
+            reward = self.reward
+            reward_text = font.render(f"Cumulative Reward: {reward:.2f}", True, BLACK)
+            self.screen.blit(reward_text, (10, 50))
+
+            # Display current layer
+            layer_text = font.render(
+                f"Layer: {'Environment' if self.current_layer == LAYER_ENVIRONMENT else 'Notification'}",
+                True,
+                BLACK,
+            )
+            self.screen.blit(layer_text, (10, 70))
+            
+            # Display target info
+            target_text = font.render(
+                f"Target: {'Environment' if self.target.layer == LAYER_ENVIRONMENT else 'Notification'} "
+                f"({self.target.current_steps}/{self.target.required_steps})",
+                True, 
+                BLACK,
+            )
+            self.screen.blit(target_text, (10, 130))
+
+            # Display last four actions and exploration info
+            action_names = {
+                0: "Up",
+                1: "Right",
+                2: "Down",
+                3: "Left",
+                None: "None",
+                255: "None",
+            }
+
+            # Get the last 4 actions from action history if available
+            action_history = []
+            if hasattr(self, "action_history"):
+                action_history = (
+                    self.action_history[-4:] if len(self.action_history) > 0 else []
+                )
+            else:
+                # Fallback to last and second last if action_history not available
+                if hasattr(self, "last_action"):
+                    action_history.append(self.last_action)
+                if hasattr(self, "second_last_action"):
+                    action_history.insert(0, self.second_last_action)
+
+            # Pad with None if we have fewer than 4 actions
+            while len(action_history) < 4:
+                action_history.insert(0, None)
+
+            # Convert to action names
+            action_history_names = [action_names.get(a, str(a)) for a in action_history]
+
+            # Display the action history
+            history_text = font.render(
+                f"Recent actions: {' → '.join(action_history_names)}",
+                True,
+                BLACK,
+            )
+            self.screen.blit(history_text, (10, 90))
+
+            # Display exploration count
+            exploration_text = font.render(
+                f"Explored: {self.exploration_count}",
+                True,
+                BLACK,
+            )
+            self.screen.blit(exploration_text, (10, 110))
 
     def close(self):
         """
