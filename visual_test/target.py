@@ -64,8 +64,9 @@ class Target:
         self.required_steps = max(1, required_steps)  # Ensure at least 1 step is required
         self.current_steps = 0
         self.completed = False
+        self.boundaries = self.__get_boundaries()
         
-    def get_boundaries(self):
+    def __get_boundaries(self):
         """
         Calculate the target boundaries.
         

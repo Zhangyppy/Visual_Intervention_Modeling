@@ -66,7 +66,11 @@ device = (
     else "mps" if th.backends.mps.is_available() else "cpu"
 )
 print(f"Using device: {device}")
+# Fix: Properly set the default device
 th.device(device)
+# To properly set the default device
+device = th.device(device)
+th.set_default_device(device) if hasattr(th, "set_default_device") else None
 
 # _detect_oscillation parameters for tuning
 HISTORY_LENGTH = 10  # Track more positions for better pattern detection
@@ -96,7 +100,8 @@ class VisualSimulationEnv(gym.Env):
         # First two values between -1 and 1 for movement, last value between 0 and 1 for layer selection
         # NOTE: The reason why the layer is not discrete is because the PPO do not support
         #       spaces.Tuple, so we use continuous action space for layer selection
-        #       Then we use a threshold to convert the continuous action space to a discrete #       action space
+        #       Then we use a threshold to convert the continuous action space to a discrete 
+        #       action space
         self.action_space = spaces.Box(
             low=np.array([-1, -1, 0], dtype=np.float32),
             high=np.array([1, 1, 1], dtype=np.float32),
@@ -494,18 +499,11 @@ class VisualSimulationEnv(gym.Env):
             target_completed = self.target.update_progress(True, agent_on_correct_layer)
             
             if agent_on_correct_layer:
-                # Give immediate reward for being on correct target and layer
-                reward += 50
-                
-                # Give bonus reward if target is completed
-                if target_completed:
-                    reward += 150
-                    self.reward_count += 1
+                reward += 200
+                self.reward_count += 1
             else:
-                # Penalty for being on wrong layer
                 reward -= 10
                 
-            # Check if episode is done based on reward count
             if self.reward_count >= 3:
                 done = True
         # else:
@@ -580,7 +578,7 @@ class VisualSimulationEnv(gym.Env):
         canvas.fill(WHITE)
 
         # Draw the target block
-        target_x_min, target_y_min, _, _ = self.target.get_boundaries()
+        target_x_min, target_y_min, _, _ = self.target.boundaries
         pygame.draw.rect(
             canvas,
             self.target.color,
@@ -678,7 +676,7 @@ class VisualSimulationEnv(gym.Env):
         self.screen.fill(WHITE)
 
         # Draw the target block
-        target_x_min, target_y_min, _, _ = self.target.get_boundaries()
+        target_x_min, target_y_min, _, _ = self.target.boundaries
         pygame.draw.rect(
             self.screen,
             self.target.color,
@@ -1069,39 +1067,14 @@ class VisionExtractor(BaseFeaturesExtractor):
         )
 
     def forward(self, observations: dict) -> th.Tensor:
+        device = next(self.parameters()).device
+        
         # Process visual features (already in CHW format from CustomVecTranspose)
         # Note: we only convert to tensor once if not already a tensor
         if isinstance(observations["visual"], th.Tensor):
-            visual_obs = observations["visual"]
-            if visual_obs.dtype != th.float32:
-                # Convert in place if possible
-                visual_obs = visual_obs.to(dtype=th.float32, non_blocking=True)
+            visual_obs = observations["visual"].to(device, dtype=th.float32, non_blocking=True)
         else:
-            # Pin memory if using CUDA for faster host-to-device transfer
-            if th.cuda.is_available():
-                # Reuse buffer if possible to reduce memory allocations
-                if (
-                    not hasattr(self, "_visual_tensor_buffer")
-                    or self._visual_tensor_buffer.shape[1:]
-                    != observations["visual"].shape
-                ):
-                    shape = observations["visual"].shape
-                    self._visual_tensor_buffer = th.empty(
-                        (1,) + shape if len(shape) == 3 else shape,
-                        dtype=th.float32,
-                        device="cuda",
-                    )
-
-                # Copy directly into the buffer
-                visual_obs = self._visual_tensor_buffer
-                visual_obs.copy_(
-                    th.as_tensor(
-                        observations["visual"], dtype=th.float32, device="cuda"
-                    ),
-                    non_blocking=True,
-                )
-            else:
-                visual_obs = th.as_tensor(observations["visual"], dtype=th.float32)
+            visual_obs = th.as_tensor(observations["visual"], dtype=th.float32, device=device)
 
         # Add batch dimension (CHW -> NCHW)
         if visual_obs.dim() == 3:
@@ -1115,18 +1088,9 @@ class VisionExtractor(BaseFeaturesExtractor):
 
         # Process position features
         if isinstance(observations["position"], th.Tensor):
-            pos_obs = observations["position"]
-            if pos_obs.dtype != th.float32:
-                # Convert in place if possible
-                pos_obs = pos_obs.to(dtype=th.float32, non_blocking=True)
+            pos_obs = observations["position"].to(device, dtype=th.float32, non_blocking=True)
         else:
-            # Use cuda if available for consistency with visual features
-            if th.cuda.is_available():
-                pos_obs = th.as_tensor(
-                    observations["position"], dtype=th.float32, device="cuda"
-                )
-            else:
-                pos_obs = th.as_tensor(observations["position"], dtype=th.float32)
+            pos_obs = th.as_tensor(observations["position"], dtype=th.float32, device=device)
 
         # Add batch dimension if needed
         if pos_obs.dim() == 1:
@@ -1139,29 +1103,14 @@ class VisionExtractor(BaseFeaturesExtractor):
 
         # Process layer features
         if isinstance(observations["current_layer"], th.Tensor):
-            curr_layer_obs = observations["current_layer"]
-            if curr_layer_obs.dtype != th.float32:
-                curr_layer_obs = curr_layer_obs.to(dtype=th.float32, non_blocking=True)
+            curr_layer_obs = observations["current_layer"].to(device, dtype=th.float32, non_blocking=True)
         else:
-            if th.cuda.is_available():
-                curr_layer_obs = th.as_tensor(
-                    observations["current_layer"], dtype=th.float32, device="cuda"
-                )
-            else:
-                curr_layer_obs = th.as_tensor(
-                    observations["current_layer"], dtype=th.float32
-                )
+            curr_layer_obs = th.as_tensor(observations["current_layer"], dtype=th.float32, device=device)
 
         if isinstance(observations["target_layer"], th.Tensor):
-            target_layer_obs = observations["target_layer"]
-            if target_layer_obs.dtype != th.float32:
-                target_layer_obs = target_layer_obs.to(
-                    dtype=th.float32, non_blocking=True
-                )
+            target_layer_obs = observations["target_layer"].to(device, dtype=th.float32, non_blocking=True)
         else:
-            target_layer_obs = th.as_tensor(
-                observations["target_layer"], dtype=th.float32
-            )
+            target_layer_obs = th.as_tensor(observations["target_layer"], dtype=th.float32, device=device)
 
         # Add batch dimension if needed
         # if action_history_obs.dim() == 1:
@@ -1249,7 +1198,6 @@ class CustomVecTranspose(VecTransposeImage):
             # This is the most common case during training
             visual_obs = obs[0]["visual"]  # Shape: (H, W, C) or (1, H, W, C)
             position = obs[0]["position"]  # Shape: (2,) or (1, 2)
-            # action_history = obs[0]["action_history"]  # Shape: (10,) or (1, 10)
             curr_layer = obs[0]["current_layer"]  # Shape: (n_stack,) or (1, n_stack)
             target_layer = obs[0]["target_layer"]  # Shape: (n_stack,) or (1, n_stack)
 
@@ -1280,23 +1228,8 @@ class CustomVecTranspose(VecTransposeImage):
             and len(visual_obs.shape) == 3
             and visual_obs.shape[2] <= 12
         ):
-            # Standard case - needs transpose
-            h, w, c = visual_obs.shape
-
-            # Create or resize transpose buffer if needed
-            if not hasattr(
-                self, "_transpose_buffer"
-            ) or self._transpose_buffer.shape != (c, h, w):
-                # First usage or shape changed, create new buffer with exact shape needed
-                self._transpose_buffer = np.empty((c, h, w), dtype=visual_obs.dtype)
-
-            # Manual optimized transpose to reuse existing buffer (no new allocation)
-            # it should faster than np.transpose which would create a new array
-            for i in range(c):
-                # Direct slice assignment is more efficient than np.copyto
-                self._transpose_buffer[i] = visual_obs[:, :, i]
-
-            visual_result = self._transpose_buffer
+            # Use numpy's optimized transpose instead of manual loop
+            visual_result = np.ascontiguousarray(np.transpose(visual_obs, (2, 0, 1)))
         else:
             # Already in the right format or special case, no need to transpose
             visual_result = visual_obs
@@ -1478,7 +1411,7 @@ if __name__ == "__main__":
     # Training parameters
     total_timesteps = 1000000
     check_freq = 50000  # Save checkpoint every 50k steps
-    MODEL_TAG = "PPO_Layer_texture_attention_nn_Continuous"
+    MODEL_TAG = "PPO_Layer_texture_attention_v2_nn_Continuous_fix_reward_and_performance"
 
     # Create environment with frame stacking
     n_stack = 4  # Stack 4 frames
