@@ -49,7 +49,8 @@ def manual_evaluate(model, env, n_episodes=10):
         # Initialize frame stacking with duplicate frames
         frames_history = [obs["visual"]] * STACKED_FRAMES
         positions_history = [obs["position"]] * STACKED_FRAMES
-        layers_history = [obs["current_layer"]] * STACKED_FRAMES
+        curr_layer_history = [obs["current_layer"]] * STACKED_FRAMES
+        target_layer_history = [obs["target_layer"]] * STACKED_FRAMES
 
         while not (done or truncated) and step_count < 100:
             try:
@@ -61,20 +62,24 @@ def manual_evaluate(model, env, n_episodes=10):
 
                 stacked_visual = np.concatenate(stacked_frames, axis=0)
                 stacked_position = np.concatenate(positions_history)
-                stacked_layers = np.concatenate(layers_history)
+                stacked_current_layer = np.concatenate(curr_layer_history)
+                stacked_target_layer = np.concatenate(target_layer_history)
 
                 # Ensure correct data types
                 if stacked_visual.dtype != np.uint8:
                     stacked_visual = stacked_visual.astype(np.uint8)
                 if stacked_position.dtype != np.float32:
                     stacked_position = stacked_position.astype(np.float32)
-                if stacked_layers.dtype != np.int8:
-                    stacked_layers = stacked_layers.astype(np.int8)
+                if stacked_current_layer.dtype != np.int8:
+                    stacked_current_layer = stacked_current_layer.astype(np.int8)
+                if stacked_target_layer.dtype != np.int8:
+                    stacked_target_layer = stacked_target_layer.astype(np.int8)
 
                 stacked_obs = {
                     "visual": stacked_visual,
                     "position": stacked_position,
-                    "current_layer": stacked_layers,
+                    "current_layer": stacked_current_layer,
+                    "target_layer": stacked_target_layer,
                 }
 
                 # Get and convert action
@@ -100,8 +105,8 @@ def manual_evaluate(model, env, n_episodes=10):
                 frames_history.append(next_obs["visual"])
                 positions_history.pop(0)
                 positions_history.append(next_obs["position"])
-                layers_history.pop(0)
-                layers_history.append(next_obs["current_layer"])
+                curr_layer_history.pop(0)
+                curr_layer_history.append(next_obs["current_layer"])
 
                 # Render and add delay for visibility
                 env.render()

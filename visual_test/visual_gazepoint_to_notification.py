@@ -10,6 +10,7 @@ import pygame
 import random
 import os
 import torch as th
+from cbam import CBAM
 
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.monitor import Monitor
@@ -37,6 +38,11 @@ WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 RED = (255, 0, 0)
 BLUE = (0, 0, 255)
+GREEN = (0, 255, 0)
+NOTIFICATION_COLORS = BLUE
+ENVIRONMENT_COLORS = GREEN
+BLUE_TEXTURE = (70, 70, 220)
+GREEN_TEXTURE = (0, 100, 0)
 
 # Constants
 AGENT_RADIUS = 5
@@ -500,9 +506,9 @@ class VisualSimulationEnv(gym.Env):
         # --- Reward Structure ---
         reward = -0.1
 
-        # Boundary penalty
-        if hit_boundary:
-            reward -= 10
+        # # Boundary penalty
+        # if hit_boundary:
+        #     reward -= 10
 
         # Terminal reward for reaching target (only if on same layer)
         if self._check_collision(self.target_layer_block_size):
@@ -511,7 +517,7 @@ class VisualSimulationEnv(gym.Env):
                 reward += 200
                 self.reward_count += 1
             else:
-                reward -= 5
+                reward -= 10
             if self.reward_count >= 3:
                 done = True
         # else:
@@ -561,8 +567,8 @@ class VisualSimulationEnv(gym.Env):
             # diminishing reward for finding new positions
             reward += 1 * math.exp(len(self.visited_positions) * -0.05)
 
-        if prev_layer != self.current_layer:
-            reward -= 0.2
+        # if prev_layer != self.current_layer:
+        #     reward -= 0.2
 
         # Check if episode is done due to step limit
         if self._steps >= self._ep_length:
@@ -585,7 +591,7 @@ class VisualSimulationEnv(gym.Env):
         canvas = self._obs_canvas
         canvas.fill(WHITE)
 
-        # Draw the blue target block
+        # Draw the target block
         target_x_min, target_y_min, _, _ = self._get_target_boundaries(
             self.target_layer_block_size
         )
@@ -599,6 +605,36 @@ class VisualSimulationEnv(gym.Env):
                 self.target_layer_block_size,
             ),
         )
+
+        # add texture to the target block
+        if self.target_layer == LAYER_ENVIRONMENT:
+            # for environment layer: add small horizontal lines inside the block
+            line_spacing = self.target_layer_block_size // 4
+            for i in range(1, 4):
+                pygame.draw.line(
+                    canvas,
+                    GREEN_TEXTURE,
+                    (target_x_min, target_y_min + i * line_spacing),
+                    (
+                        target_x_min + self.target_layer_block_size,
+                        target_y_min + i * line_spacing,
+                    ),
+                    1,
+                )
+            else:  # LAYER_NOTIFICATION
+                # for notification layer: add small vertical lines inside the block
+                line_spacing = self.target_layer_block_size // 4
+                for i in range(1, 4):
+                    pygame.draw.line(
+                        canvas,
+                        BLUE_TEXTURE,
+                        (target_x_min + i * line_spacing, target_y_min),
+                        (
+                            target_x_min + i * line_spacing,
+                            target_y_min + self.target_layer_block_size,
+                        ),
+                        1,  # Thin line
+                    )
 
         # Draw the red agent
         pygame.draw.circle(canvas, RED, self.agent_pos.astype(int), AGENT_RADIUS)
@@ -659,9 +695,14 @@ class VisualSimulationEnv(gym.Env):
         target_x_min, target_y_min, _, _ = self._get_target_boundaries(
             self.target_layer_block_size
         )
+        target_color = (
+            NOTIFICATION_COLORS
+            if self.target_layer == LAYER_NOTIFICATION
+            else ENVIRONMENT_COLORS
+        )
         pygame.draw.rect(
             self.screen,
-            BLUE,
+            target_color,
             (
                 target_x_min,
                 target_y_min,
@@ -910,6 +951,7 @@ class VisionExtractor(BaseFeaturesExtractor):
                 padding=(1, 1),
             ),
             th.nn.LeakyReLU(),
+            # CBAM(gate_channels=8, reduction_ratio=2),
             th.nn.Conv2d(
                 in_channels=8,
                 out_channels=16,
@@ -918,6 +960,7 @@ class VisionExtractor(BaseFeaturesExtractor):
                 stride=(2, 2),
             ),
             th.nn.LeakyReLU(),
+            # CBAM(gate_channels=16, reduction_ratio=4),
             th.nn.Conv2d(
                 in_channels=16,
                 out_channels=32,
@@ -1422,7 +1465,7 @@ if __name__ == "__main__":
     # Training parameters
     total_timesteps = 1000000
     check_freq = 50000  # Save checkpoint every 50k steps
-    MODEL_TAG = "PPO_Layer_target_layer_nn_Continuous"
+    MODEL_TAG = "PPO_Layer_texture_attention_nn_Continuous"
 
     # Create environment with frame stacking
     n_stack = 4  # Stack 4 frames
@@ -1452,10 +1495,10 @@ if __name__ == "__main__":
         learning_rate=3e-4,
         n_steps=2048,
         batch_size=512,
-        ent_coef=0.005,
+        ent_coef=0.01,
         tensorboard_log=os.path.join("Training", "Logs"),
         device=device,
-        target_kl=0.1,
+        target_kl=0.05,
     )
 
     # Configure garbage collection
