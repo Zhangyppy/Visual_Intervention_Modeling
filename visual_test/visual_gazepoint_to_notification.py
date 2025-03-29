@@ -66,9 +66,7 @@ device = (
     else "mps" if th.backends.mps.is_available() else "cpu"
 )
 print(f"Using device: {device}")
-# Fix: Properly set the default device
 th.device(device)
-# To properly set the default device
 device = th.device(device)
 th.set_default_device(device) if hasattr(th, "set_default_device") else None
 
@@ -603,7 +601,7 @@ class VisualSimulationEnv(gym.Env):
                         target_x_min + self.target.size,
                         target_y_min + i * line_spacing,
                     ),
-                    1,
+                    2,
                 )
         else:  # LAYER_NOTIFICATION
             # for notification layer: add small vertical lines inside the block
@@ -617,7 +615,7 @@ class VisualSimulationEnv(gym.Env):
                         target_x_min + i * line_spacing,
                         target_y_min + self.target.size,
                     ),
-                    1,  # Thin line
+                    2,
                 )
 
         # Draw the red agent
@@ -1198,6 +1196,7 @@ class CustomVecTranspose(VecTransposeImage):
             # This is the most common case during training
             visual_obs = obs[0]["visual"]  # Shape: (H, W, C) or (1, H, W, C)
             position = obs[0]["position"]  # Shape: (2,) or (1, 2)
+            # action_history = obs[0]["action_history"]  # Shape: (10,) or (1, 10)
             curr_layer = obs[0]["current_layer"]  # Shape: (n_stack,) or (1, n_stack)
             target_layer = obs[0]["target_layer"]  # Shape: (n_stack,) or (1, n_stack)
 
@@ -1384,25 +1383,24 @@ def create_eval_env_with_frame_stacking(n_stack=4, render_mode="human", debug=Fa
 class MemoryManagementCallback(BaseCallback):
     def __init__(self, verbose=0):
         super().__init__(verbose)
+        self.last_memory_check = 0
 
     def _on_step(self) -> bool:
-        # Run garbage collection when memory is low or every 50K steps
-        import psutil
-
-        memory_percent = psutil.virtual_memory().percent
-        if memory_percent > 95 or self.num_timesteps % 50000 == 0:
+        if self.num_timesteps - self.last_memory_check > 50000:
+            self.last_memory_check = self.num_timesteps
             gc.collect()
             if th.cuda.is_available():
-                # Clear CUDA cache if using GPU
                 th.cuda.empty_cache()
 
             # Log memory usage if verbose
             if self.verbose > 0:
                 import psutil
-
                 memory_usage = psutil.Process().memory_info().rss / (1024 * 1024)
-                print(f"Step {self.num_timesteps}: Memory usage: {memory_usage:.2f} MB")
-
+                gpu_memory = ''
+                if th.cuda.is_available():
+                    gpu_memory = f", GPU memory: {th.cuda.memory_allocated() / 1024 / 1024:.1f}MB"
+                print(f"Step {self.num_timesteps}: Memory usage: {memory_usage:.2f}MB{gpu_memory}")
+        
         return True
 
 
@@ -1411,7 +1409,7 @@ if __name__ == "__main__":
     # Training parameters
     total_timesteps = 1000000
     check_freq = 50000  # Save checkpoint every 50k steps
-    MODEL_TAG = "PPO_Layer_texture_attention_v2_nn_Continuous_fix_reward_and_performance"
+    MODEL_TAG = "PPO_Layer_texture_attention_v2_nn_Continuous_fix_reward_and_performance_ent_coef_0.001"
 
     # Create environment with frame stacking
     n_stack = 4  # Stack 4 frames
@@ -1441,7 +1439,7 @@ if __name__ == "__main__":
         learning_rate=3e-4,
         n_steps=2048,
         batch_size=512,
-        ent_coef=0.01,
+        ent_coef=0.001,
         tensorboard_log=os.path.join("Training", "Logs"),
         device=device,
         target_kl=0.05,
