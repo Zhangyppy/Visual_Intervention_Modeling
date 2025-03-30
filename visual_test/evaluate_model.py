@@ -38,6 +38,8 @@ def manual_evaluate(model, env, n_episodes=10):
     Handles observation preprocessing to match training format.
     """
     rewards = []
+    targets_collected = []
+    persistent_visits = []
 
     for episode in range(n_episodes):
         obs, _ = env.reset()
@@ -45,12 +47,17 @@ def manual_evaluate(model, env, n_episodes=10):
         truncated = False
         episode_reward = 0
         step_count = 0
+        episode_targets = 0
+        persistent_target_visits = 0
 
         # Initialize frame stacking with duplicate frames
         frames_history = [obs["visual"]] * STACKED_FRAMES
         positions_history = [obs["position"]] * STACKED_FRAMES
         curr_layer_history = [obs["current_layer"]] * STACKED_FRAMES
         target_layer_history = [obs["target_layer"]] * STACKED_FRAMES
+
+        # Track previous target completion state to detect new completions
+        prev_target_completed = False
 
         while not (done or truncated) and step_count < 100:
             try:
@@ -100,6 +107,35 @@ def manual_evaluate(model, env, n_episodes=10):
                 episode_reward += reward
                 step_count += 1
 
+                # Check if targets were collected
+                # Look at the environment's current target completion status
+                if (
+                    hasattr(env, "target")
+                    and hasattr(env, "has_expirable_target")
+                    and env.has_expirable_target
+                    and env.target.completed
+                    and not prev_target_completed
+                ):
+                    episode_targets += 1
+                    prev_target_completed = True
+                elif (
+                    hasattr(env, "target")
+                    and hasattr(env, "has_expirable_target")
+                    and env.has_expirable_target
+                    and not env.target.completed
+                ):
+                    prev_target_completed = False
+
+                # Track visits to persistent target
+                if hasattr(env, "persistent_target") and hasattr(env, "current_layer"):
+                    if (
+                        env.persistent_target.check_collision(
+                            env.agent_pos, AGENT_RADIUS
+                        )
+                        and env.current_layer == env.persistent_target.layer
+                    ):
+                        persistent_target_visits += 1
+
                 # Update frame history
                 frames_history.pop(0)
                 frames_history.append(next_obs["visual"])
@@ -107,6 +143,8 @@ def manual_evaluate(model, env, n_episodes=10):
                 positions_history.append(next_obs["position"])
                 curr_layer_history.pop(0)
                 curr_layer_history.append(next_obs["current_layer"])
+                target_layer_history.pop(0)
+                target_layer_history.append(next_obs["target_layer"])
 
                 # Render and add delay for visibility
                 env.render()
@@ -120,9 +158,29 @@ def manual_evaluate(model, env, n_episodes=10):
                 break
 
         rewards.append(episode_reward)
-        print(f"Episode {episode+1} reward: {episode_reward}, steps: {step_count}")
+        targets_collected.append(episode_targets)
+        persistent_visits.append(persistent_target_visits)
+
+        print(f"Episode {episode+1}:")
+        print(f"  Reward: {episode_reward:.2f}")
+        print(f"  Steps: {step_count}")
+        print(f"  Expirable targets collected: {episode_targets}")
+        print(f"  Persistent target interactions: {persistent_target_visits}")
+        print("-------------------------------")
 
     mean_reward = sum(rewards) / len(rewards) if rewards else 0
+    mean_targets = (
+        sum(targets_collected) / len(targets_collected) if targets_collected else 0
+    )
+    mean_persistent = (
+        sum(persistent_visits) / len(persistent_visits) if persistent_visits else 0
+    )
+
+    print("\nEvaluation Summary:")
+    print(f"  Mean reward: {mean_reward:.2f}")
+    print(f"  Mean expirable targets collected: {mean_targets:.2f}")
+    print(f"  Mean persistent target interactions: {mean_persistent:.2f}")
+
     return mean_reward
 
 
@@ -150,7 +208,6 @@ if __name__ == "__main__":
     print("Evaluating model...")
     try:
         mean_reward = manual_evaluate(model, eval_env, n_episodes=10)
-        print(f"Mean reward: {mean_reward:.2f}")
     except Exception as e:
         print(f"Error during evaluation: {e}")
         import traceback
