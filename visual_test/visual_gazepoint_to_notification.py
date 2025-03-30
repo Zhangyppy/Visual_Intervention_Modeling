@@ -63,7 +63,8 @@ LAYER_NOTIFICATION = 1
 device = (
     "cuda"
     if th.cuda.is_available()
-    else "mps" if th.backends.mps.is_available() else "cpu"
+    # else "mps" if th.backends.mps.is_available()
+    else "cpu"
 )
 print(f"Using device: {device}")
 th.device(device)
@@ -192,9 +193,7 @@ class VisualSimulationEnv(gym.Env):
         self.visited_positions = set()
         self.position_history = [self.agent_pos.copy()]
         self.target_distance_history = np.zeros(10, dtype=np.float32)
-        self.target_distance_history[0] = np.linalg.norm(
-            self.agent_pos - self.expirable_target.pos
-        )
+        self.target_distance_history[0] = 0
         self.oscillation_cooldown = 0
 
     def _initialize_positions(self):
@@ -209,7 +208,12 @@ class VisualSimulationEnv(gym.Env):
 
         # Create the persistent target (never expires, lower reward)
         self.persistent_target = self._create_random_target(
-            expires=False, reward=50, required_steps=1
+            expires=False,
+            reward=50,
+            required_steps=1,
+            color=BLUE,
+            size=ENVIRONMENT_BLOCK_SIZE,
+            layer=LAYER_ENVIRONMENT,
         )
 
         # Initialize target attribute (this will be set later in _update_expireable_targets)
@@ -217,7 +221,14 @@ class VisualSimulationEnv(gym.Env):
         self.expirable_target = None
 
     def _create_random_target(
-        self, expires=True, reward=200, required_steps=3, max_lifetime=30, size=None
+        self,
+        expires=True,
+        reward=200,
+        required_steps=3,
+        max_lifetime=30,
+        size=None,
+        color=None,
+        layer=None,
     ):
         """
         Create a random target with specified properties
@@ -260,6 +271,8 @@ class VisualSimulationEnv(gym.Env):
             expires=expires,
             max_lifetime=max_lifetime,
             size=size,
+            color=color,
+            layer=layer,
         )
 
     def _init_render(self):
@@ -320,6 +333,7 @@ class VisualSimulationEnv(gym.Env):
         """
         Enhanced oscillation detection that handles both local minimum (not moving enough)
         and looping behavior patterns.
+        NOTE: outdated
         """
         # Skip detection during initial steps or during cooldown
         if self._steps < HISTORY_LENGTH:
@@ -601,13 +615,27 @@ class VisualSimulationEnv(gym.Env):
         if not self.has_expirable_target:
             # Check if we've passed the minimum generation gap and haven't reached max targets
             steps_since_last = self._steps - self.last_target_generation_step
+
+            # randomize the layer of the expirable target
+            layer = random.randint(0, 1)
+
             if (
                 steps_since_last >= self.min_target_generation_gap
                 and self.expirable_target_count < self.max_expirable_targets
                 and random.random() < self.target_generation_probability
             ):
                 self.expirable_target = self._create_random_target(
-                    expires=True, reward=200, required_steps=3, max_lifetime=30
+                    expires=True,
+                    reward=200,
+                    required_steps=3,
+                    max_lifetime=30,
+                    color=GREEN,
+                    size=(
+                        NOTIFICATION_BLOCK_SIZE
+                        if layer == LAYER_NOTIFICATION
+                        else ENVIRONMENT_BLOCK_SIZE
+                    ),
+                    layer=layer,
                 )
                 self.expirable_target_count += 1
                 self.last_target_generation_step = self._steps
@@ -621,7 +649,7 @@ class VisualSimulationEnv(gym.Env):
             if target_expired or target_completed:
                 self.has_expirable_target = False
 
-    def _draw_target(self, surface, target, is_render_mode=False):
+    def _draw_target(self, surface, target: Target, is_render_mode=False):
         """
         Helper method to draw a target on a surface
 
@@ -1098,6 +1126,9 @@ class VisionExtractor(BaseFeaturesExtractor):
             th.nn.Linear(64, 32),
             th.nn.ReLU(),
         )
+        print(
+            f"Position network output size: {self.pos_net(th.zeros((1, pos_dim))).shape}"
+        )
 
         # Create a network for processing layer data (binary input with frame stacking)
         self.curr_layer_net = th.nn.Sequential(
@@ -1105,6 +1136,9 @@ class VisionExtractor(BaseFeaturesExtractor):
             th.nn.ReLU(),
             th.nn.Linear(32, 16),
             th.nn.ReLU(),
+        )
+        print(
+            f"Layer network output size: {self.curr_layer_net(th.zeros((1, layer_dim))).shape}"
         )
 
         # self.target_layer_net = th.nn.Sequential(
@@ -1129,7 +1163,7 @@ class VisionExtractor(BaseFeaturesExtractor):
             # th.nn.LayerNorm(features_dim),
             # th.nn.ReLU(),
             th.nn.Linear(
-                n_flatten + 32 + 16 + 16, features_dim
+                n_flatten + 32 + 16, features_dim
             ),  # 32 for position features, 16 for layer features
             th.nn.ReLU(),
         )
@@ -1498,7 +1532,7 @@ if __name__ == "__main__":
     # Training parameters
     total_timesteps = 1000000
     check_freq = 50000  # Save checkpoint every 50k steps
-    MODEL_TAG = "PPO_Layer_texture_attention_v2_nn_Continuous_fix_reward_and_performance_ent_coef_0.001"
+    MODEL_TAG = "PPO_expirable_target_nn_Continuous"
 
     # Create environment with frame stacking
     n_stack = 4  # Stack 4 frames

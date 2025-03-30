@@ -54,7 +54,7 @@ def manual_evaluate(model, env, n_episodes=10):
         frames_history = [obs["visual"]] * STACKED_FRAMES
         positions_history = [obs["position"]] * STACKED_FRAMES
         curr_layer_history = [obs["current_layer"]] * STACKED_FRAMES
-        target_layer_history = [obs["target_layer"]] * STACKED_FRAMES
+        # target_layer_history = [obs["target_layer"]] * STACKED_FRAMES
 
         # Track previous target completion state to detect new completions
         prev_target_completed = False
@@ -70,7 +70,7 @@ def manual_evaluate(model, env, n_episodes=10):
                 stacked_visual = np.concatenate(stacked_frames, axis=0)
                 stacked_position = np.concatenate(positions_history)
                 stacked_current_layer = np.concatenate(curr_layer_history)
-                stacked_target_layer = np.concatenate(target_layer_history)
+                # stacked_target_layer = np.concatenate(target_layer_history)
 
                 # Ensure correct data types
                 if stacked_visual.dtype != np.uint8:
@@ -79,14 +79,14 @@ def manual_evaluate(model, env, n_episodes=10):
                     stacked_position = stacked_position.astype(np.float32)
                 if stacked_current_layer.dtype != np.int8:
                     stacked_current_layer = stacked_current_layer.astype(np.int8)
-                if stacked_target_layer.dtype != np.int8:
-                    stacked_target_layer = stacked_target_layer.astype(np.int8)
+                # if stacked_target_layer.dtype != np.int8:
+                #     stacked_target_layer = stacked_target_layer.astype(np.int8)
 
                 stacked_obs = {
                     "visual": stacked_visual,
                     "position": stacked_position,
                     "current_layer": stacked_current_layer,
-                    "target_layer": stacked_target_layer,
+                    # "target_layer": stacked_target_layer,
                 }
 
                 # Get and convert action
@@ -143,8 +143,8 @@ def manual_evaluate(model, env, n_episodes=10):
                 positions_history.append(next_obs["position"])
                 curr_layer_history.pop(0)
                 curr_layer_history.append(next_obs["current_layer"])
-                target_layer_history.pop(0)
-                target_layer_history.append(next_obs["target_layer"])
+                # target_layer_history.pop(0)
+                # target_layer_history.append(next_obs["target_layer"])
 
                 # Render and add delay for visibility
                 env.render()
