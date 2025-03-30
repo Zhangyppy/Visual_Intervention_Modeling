@@ -209,7 +209,7 @@ class VisualSimulationEnv(gym.Env):
         # Create the persistent target (never expires, lower reward)
         self.persistent_target = self._create_random_target(
             expires=False,
-            reward=50,
+            reward=1,
             required_steps=1,
             color=BLUE,
             size=ENVIRONMENT_BLOCK_SIZE,
@@ -223,7 +223,7 @@ class VisualSimulationEnv(gym.Env):
     def _create_random_target(
         self,
         expires=True,
-        reward=200,
+        reward=40,
         required_steps=3,
         max_lifetime=30,
         size=None,
@@ -550,7 +550,7 @@ class VisualSimulationEnv(gym.Env):
         reward += self._handle_target_interactions()
 
         # Update target lifetimes and generate new targets if needed
-        self._update_expireable_targets()
+        self._update_expirable_targets()
 
         # Reward for exploring new positions, use discretized position for our convience
         # Discretize position to track visited areas
@@ -561,7 +561,7 @@ class VisualSimulationEnv(gym.Env):
         if grid_pos not in self.visited_positions:
             self.visited_positions.add(grid_pos)
             # diminishing reward for finding new positions
-            reward += 1 * math.exp(len(self.visited_positions) * -0.05)
+            reward += 0.5 * math.exp(len(self.visited_positions) * -0.05)
 
         # Check if episode is done due to step limit
         if self._steps >= self._ep_length:
@@ -583,7 +583,7 @@ class VisualSimulationEnv(gym.Env):
                 # Always give reward for persistent target (lower reward)
                 reward += self.persistent_target.reward
             else:
-                reward -= 10
+                reward -= self.persistent_target.reward / 4
 
         # Check expirable target if it exists
         if self.has_expirable_target and self.expirable_target.check_collision(
@@ -599,15 +599,20 @@ class VisualSimulationEnv(gym.Env):
                 reward += self.expirable_target.reward
                 self.reward_count += 1
             else:
-                reward -= 10
+                reward -= self.expirable_target.reward / 4
+
+            # Immediately update has_expirable_target if the target is completed
+            if target_completed:
+                self.has_expirable_target = False
+
         elif self.has_expirable_target:
             # Update target progress (not on target)
             self.expirable_target.update_progress(False, False)
 
         return reward
 
-    def _update_expireable_targets(self):
-        """Update expireable target lifetimes and generate new ones if needed"""
+    def _update_expirable_targets(self):
+        """Update expirable target lifetimes and generate new ones if needed"""
         # TODO: this is just a temporary solution that only support 1 expirable target
         # we should update this to support multiple expirable targets if the task requires it
 
@@ -626,7 +631,7 @@ class VisualSimulationEnv(gym.Env):
             ):
                 self.expirable_target = self._create_random_target(
                     expires=True,
-                    reward=200,
+                    reward=40,
                     required_steps=3,
                     max_lifetime=30,
                     color=GREEN,
@@ -641,12 +646,11 @@ class VisualSimulationEnv(gym.Env):
                 self.last_target_generation_step = self._steps
                 self.has_expirable_target = True
         else:
-            # Update existing expirable target
+            # Update existing expirable target's lifetime
             target_expired = self.expirable_target.update_lifetime()
-            target_completed = self.expirable_target.completed
 
-            # If the target expired or was completed, mark it as inactive
-            if target_expired or target_completed:
+            # If the target expired, mark it as inactive
+            if target_expired:
                 self.has_expirable_target = False
 
     def _draw_target(self, surface, target: Target, is_render_mode=False):
