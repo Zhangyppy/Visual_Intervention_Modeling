@@ -2,6 +2,7 @@ import datetime
 import gc
 import math
 from gymnasium import spaces
+from gymnasium.wrappers import TimeLimit
 import gymnasium as gym
 import numpy as np
 import pickle
@@ -46,15 +47,16 @@ BLUE_TEXTURE = (70, 70, 220)
 GREEN_TEXTURE = (0, 100, 0)
 
 # Constants
-AGENT_RADIUS = 5
-BLOCK_SIZE = 40
-MAX_MOVE_SPEED = 20  # Maximum speed for continuous actions
-MIN_MOVE_SPEED = 5  # Minimum speed for movement when action is non-zero
+AGENT_RADIUS = 10
+ENVIRONMENT_BLOCK_SIZE = 30  # Size of block when on environment layer
+NOTIFICATION_BLOCK_SIZE = 50  # Size of block when on notification layer
+MAX_MOVE_SPEED = 30  # Maximum speed for continuous actions
+MIN_MOVE_SPEED = 1  # Minimum speed for movement when action is non-zero
 MIN_BLOCK_GENERATION_DISTANCE = (
-    50  # Minimum distance between agent and target to generate a block
+    max(NOTIFICATION_BLOCK_SIZE + 10, 60)  # Minimum distance between agent and target to generate a block
 )
-ENVIRONMENT_BLOCK_SIZE = 20  # Size of block when on environment layer
-NOTIFICATION_BLOCK_SIZE = 40  # Size of block when on notification layer
+BOUNDARY_PENALTY = 1  # Penalty for hitting the boundary
+COMPLETION_REWARD = 100  # Reward for completing all expirable targets
 
 LAYER_ENVIRONMENT = 0
 LAYER_NOTIFICATION = 1
@@ -142,17 +144,22 @@ class VisualSimulationEnv(gym.Env):
                     ),  # Layer information as a float (0: environment, 1: notification)
                     dtype=np.int8,
                 ),
-                # "target_layer": spaces.Box(
-                #     low=np.array([0], dtype=np.int8),
-                #     high=np.array([1], dtype=np.int8),
-                #     shape=(1,),
-                #     dtype=np.int8,
-                # ),
+                "persistent_target_layer": spaces.Box(
+                    low=np.array([0], dtype=np.int8),
+                    high=np.array([1], dtype=np.int8),
+                    shape=(1,),
+                    dtype=np.int8,
+                ),
+                "expirable_target_layer": spaces.Box(
+                    low=np.array([-1], dtype=np.int8),  # -1 means no expirable target
+                    high=np.array([1], dtype=np.int8),
+                    shape=(1,),
+                    dtype=np.int8,
+                ),
             }
         )
 
         # --- Episode Variables ---
-        self._ep_length = 100  # Max episode length
         self._steps = 0  # Current step
         self.max_expirable_targets = 2  # Maximum number of expirable targets per episode, usually we give more reward to these targets
         self.expirable_target_count = 0
@@ -195,6 +202,7 @@ class VisualSimulationEnv(gym.Env):
         self.target_distance_history = np.zeros(10, dtype=np.float32)
         self.target_distance_history[0] = 0
         self.oscillation_cooldown = 0
+        self.previous_layer = LAYER_ENVIRONMENT
 
     def _initialize_positions(self):
         """Initialize agent and target positions"""
@@ -209,7 +217,7 @@ class VisualSimulationEnv(gym.Env):
         # Create the persistent target (never expires, lower reward)
         self.persistent_target = self._create_random_target(
             expires=False,
-            reward=1,
+            reward=5,
             required_steps=1,
             color=BLUE,
             size=ENVIRONMENT_BLOCK_SIZE,
@@ -281,11 +289,12 @@ class VisualSimulationEnv(gym.Env):
         pygame.display.set_caption("Visual Attention Task")
         self.clock = pygame.time.Clock()
 
-    def reset(self, seed=None):
+    def reset(self, seed=None, options=None):
         """Reset the environment to initial state.
 
         Args:
             seed: Random seed for reproducibility
+            options: Additional options for reset (compatibility with newer Gymnasium versions)
 
         Returns:
             tuple: (observation, info)
@@ -488,7 +497,7 @@ class VisualSimulationEnv(gym.Env):
                     pygame.quit()
 
         self._steps += 1
-        done = False
+        terminated = False
 
         # Extract movement and layer actions from the combined action vector
         movement_action = action[:2]  # First two components for movement
@@ -552,6 +561,12 @@ class VisualSimulationEnv(gym.Env):
         # Update target lifetimes and generate new targets if needed
         self._update_expirable_targets()
 
+        # Termination for completing all expirable targets
+        if self.expirable_target_count >= self.max_expirable_targets and not self.has_expirable_target:
+            terminated = True
+            reward += COMPLETION_REWARD
+            self.reward += COMPLETION_REWARD
+
         # Reward for exploring new positions, use discretized position for our convience
         # Discretize position to track visited areas
         grid_x = int(self.agent_pos[0] // GRID_SIZE)
@@ -561,16 +576,22 @@ class VisualSimulationEnv(gym.Env):
         if grid_pos not in self.visited_positions:
             self.visited_positions.add(grid_pos)
             # diminishing reward for finding new positions
-            reward += 0.5 * math.exp(len(self.visited_positions) * -0.05)
+            reward += 1 * math.exp(len(self.visited_positions) * -0.05)
 
-        # Check if episode is done due to step limit
-        if self._steps >= self._ep_length:
-            done = True
+        if hit_boundary:
+            reward = 0
+            reward -= BOUNDARY_PENALTY
 
         # Store the reward for rendering purposes
         self.reward += reward
 
-        return self._get_obs(), reward, done, False, {}
+        # Update previous layer
+        self.previous_layer = self.current_layer
+
+        return self._get_obs(), reward, terminated, False, {}
+    
+    def _is_agent_switched_layer(self):
+        return self.previous_layer != self.current_layer
 
     def _handle_target_interactions(self):
         """Handle interactions with both persistent and expirable targets"""
@@ -578,17 +599,25 @@ class VisualSimulationEnv(gym.Env):
 
         # Check persistent target first
         if self.persistent_target.check_collision(self.agent_pos, AGENT_RADIUS):
+            # small reward for agent exploring new layer
+            if self._is_agent_switched_layer():
+                reward += self.persistent_target.reward / 10
+
             agent_on_correct_layer = self.current_layer == self.persistent_target.layer
             if agent_on_correct_layer:
                 # Always give reward for persistent target (lower reward)
                 reward += self.persistent_target.reward
             else:
-                reward -= self.persistent_target.reward / 4
+                reward -= self.persistent_target.reward / 3
 
         # Check expirable target if it exists
         if self.has_expirable_target and self.expirable_target.check_collision(
             self.agent_pos, AGENT_RADIUS
         ):
+            # small reward for agent exploring new layer
+            if self._is_agent_switched_layer():
+                reward += 0.5
+
             # Check if agent is on the correct layer
             agent_on_correct_layer = self.current_layer == self.expirable_target.layer
             target_completed = self.expirable_target.update_progress(
@@ -599,10 +628,11 @@ class VisualSimulationEnv(gym.Env):
                 reward += self.expirable_target.reward
                 self.reward_count += 1
             else:
-                reward -= self.expirable_target.reward / 4
+                reward -= self.expirable_target.reward / 3
 
             # Immediately update has_expirable_target if the target is completed
             if target_completed:
+                reward += self.expirable_target.reward # extra reward for completing the target
                 self.has_expirable_target = False
 
         elif self.has_expirable_target:
@@ -631,9 +661,9 @@ class VisualSimulationEnv(gym.Env):
             ):
                 self.expirable_target = self._create_random_target(
                     expires=True,
-                    reward=40,
+                    reward=20,
                     required_steps=3,
-                    max_lifetime=30,
+                    max_lifetime=60,
                     color=GREEN,
                     size=(
                         NOTIFICATION_BLOCK_SIZE
@@ -731,21 +761,19 @@ class VisualSimulationEnv(gym.Env):
             np.transpose(self._visual_obs_buffer, (1, 0, 2)), canvas
         )
 
+        persistent_layer = np.array([self.persistent_target.layer], dtype=np.int8)
+        if self.has_expirable_target:
+            expirable_layer = np.array([self.expirable_target.layer], dtype=np.int8)
+        else:
+            expirable_layer = np.array([-1], dtype=np.int8)
+
         # Return both visual observation and position information
         return {
             "visual": self._visual_obs_buffer,
             "position": self.agent_pos.astype(np.float32),
             "current_layer": np.array([self.current_layer], dtype=np.int8),
-            # "target_layer": np.array(
-            #     [
-            #         (
-            #             self.expirable_target.layer
-            #             if self.has_expirable_target
-            #             else self.persistent_target.layer
-            #         )
-            #     ],
-            #     dtype=np.int8,
-            # ),
+            "persistent_target_layer": persistent_layer,
+            "expirable_target_layer": expirable_layer,
         }
 
     def render(self, mode="human"):
@@ -806,7 +834,7 @@ class VisualSimulationEnv(gym.Env):
 
             # Display step count
             steps_text = font.render(
-                f"Steps: {self._steps}/{self._ep_length}", True, BLACK
+                f"Steps: {self._steps}", True, BLACK
             )
             self.screen.blit(steps_text, (10, 10))
 
@@ -1051,15 +1079,30 @@ class VisionExtractor(BaseFeaturesExtractor):
                     x, size=resize_to, mode="bilinear", align_corners=False
                 )
 
+        """
+        CNN overhual plan:
+        Why update the CNN architecture?
+        1. Increase initial kernel from 3x3 to 7x7 (from 9 pixels to 49 pixels)
+            Our images are quite large and sometimes we even stack multiple frames. 
+            Thus a larger kernel can enlarges receptive field to capture broader spatial patterns
+            maybe it also helps detection of motion across stacked frames
+        2. Implemente graduated kernel sizing (7→5→3→3)
+            hierarchical feature extraction (global→local)
+            more like biological vision processing
+        3. Add more padding to final conv layer
+            prevents information loss at image boundaries (reduces tunnel vision!!!! We have very serious tunnel vision problem)
+
+        Downside? Its much slower than before. Others? We need to test it out.
+        """
         self.cnn = th.nn.Sequential(
             # th.nn.Conv2d(n_input_channels, 32, 8, stride=4),
             CoordConv(
                 # th.nn.Conv2d(
                 n_input_channels,
                 output_channels=8,
-                kernel_size=(3, 3),
+                kernel_size=(5, 5),
                 stride=(2, 2),
-                padding=(1, 1),
+                padding=(3, 3),
             ),
             th.nn.LeakyReLU(),
             # CBAM(gate_channels=8, reduction_ratio=2),
@@ -1071,7 +1114,6 @@ class VisionExtractor(BaseFeaturesExtractor):
                 stride=(2, 2),
             ),
             th.nn.LeakyReLU(),
-            # CBAM(gate_channels=16, reduction_ratio=4),
             th.nn.Conv2d(
                 in_channels=16,
                 out_channels=32,
@@ -1145,6 +1187,17 @@ class VisionExtractor(BaseFeaturesExtractor):
             f"Layer network output size: {self.curr_layer_net(th.zeros((1, layer_dim))).shape}"
         )
 
+        self.persistent_target_layer_net = th.nn.Sequential(
+            th.nn.Linear(layer_dim, 16),
+            th.nn.ReLU(),
+        )
+
+        self.expirable_target_layer_net = th.nn.Sequential(
+            th.nn.Linear(layer_dim, 16),
+            th.nn.ReLU(),
+        )
+
+
         # self.target_layer_net = th.nn.Sequential(
         #     th.nn.Linear(layer_dim, 32),
         #     th.nn.ReLU(),
@@ -1167,7 +1220,7 @@ class VisionExtractor(BaseFeaturesExtractor):
             # th.nn.LayerNorm(features_dim),
             # th.nn.ReLU(),
             th.nn.Linear(
-                n_flatten + 32 + 16, features_dim
+                n_flatten + 32 + 16 + 16 + 16, features_dim
             ),  # 32 for position features, 16 for layer features
             th.nn.ReLU(),
         )
@@ -1225,6 +1278,24 @@ class VisionExtractor(BaseFeaturesExtractor):
                 observations["current_layer"], dtype=th.float32, device=device
             )
 
+        if isinstance(observations["persistent_target_layer"], th.Tensor):
+            persistent_target_layer_obs = observations["persistent_target_layer"].to(
+                device, dtype=th.float32, non_blocking=True
+            )
+        else:
+            persistent_target_layer_obs = th.as_tensor(
+                observations["persistent_target_layer"], dtype=th.float32, device=device
+            )
+
+        if isinstance(observations["expirable_target_layer"], th.Tensor):
+            expirable_target_layer_obs = observations["expirable_target_layer"].to(
+                device, dtype=th.float32, non_blocking=True
+            )
+        else:
+            expirable_target_layer_obs = th.as_tensor(
+                observations["expirable_target_layer"], dtype=th.float32, device=device
+            )
+        
         # if isinstance(observations["target_layer"], th.Tensor):
         #     target_layer_obs = observations["target_layer"].to(
         #         device, dtype=th.float32, non_blocking=True
@@ -1243,6 +1314,14 @@ class VisionExtractor(BaseFeaturesExtractor):
             curr_layer_obs = curr_layer_obs.unsqueeze(0)  # (1,) -> (1,1
         curr_layer_features = self.curr_layer_net(curr_layer_obs)
 
+        if persistent_target_layer_obs.dim() == 1:
+            persistent_target_layer_obs = persistent_target_layer_obs.unsqueeze(0)
+        persistent_layer_features = self.persistent_target_layer_net(persistent_target_layer_obs)
+
+        if expirable_target_layer_obs.dim() == 1:
+            expirable_target_layer_obs = expirable_target_layer_obs.unsqueeze(0)
+        expirable_layer_features = self.expirable_target_layer_net(expirable_target_layer_obs)
+
         # if target_layer_obs.dim() == 1:
         #     target_layer_obs = target_layer_obs.unsqueeze(0)  # (1,) -> (1,1
         # target_layer_features = self.target_layer_net(target_layer_obs)
@@ -1255,6 +1334,8 @@ class VisionExtractor(BaseFeaturesExtractor):
                     pos_features,
                     curr_layer_features,
                     # target_layer_features,
+                    persistent_layer_features,
+                    expirable_layer_features,
                 ],
                 dim=1,
             )
@@ -1297,9 +1378,12 @@ class CustomVecTranspose(VecTransposeImage):
                 "current_layer": venv.observation_space[
                     "current_layer"
                 ],  # Keep layer space as is (already stacked)
-                # "target_layer": venv.observation_space[
-                #     "target_layer"
-                # ],  # Keep layer space as is (already stacked)
+                "persistent_target_layer": venv.observation_space[
+                    "persistent_target_layer"
+                ],
+                "expirable_target_layer": venv.observation_space[
+                    "expirable_target_layer"
+                ],
             }
         )
 
@@ -1314,15 +1398,16 @@ class CustomVecTranspose(VecTransposeImage):
             visual_obs = obs["visual"]  # Shape: (H, W, C)
             position = obs["position"]  # Shape: (2,)
             curr_layer = obs["current_layer"]  # Shape: (n_stack,)
-            # target_layer = obs["target_layer"]  # Shape: (n_stack,)
+            persistent_target_layer = obs["persistent_target_layer"]  # Shape: (1,)
+            expirable_target_layer = obs["expirable_target_layer"]  # Shape: (1,)
         else:
             # For vectorized observations (e.g., from DummyVecEnv)
             # This is the most common case during training
             visual_obs = obs[0]["visual"]  # Shape: (H, W, C) or (1, H, W, C)
             position = obs[0]["position"]  # Shape: (2,) or (1, 2)
-            # action_history = obs[0]["action_history"]  # Shape: (10,) or (1, 10)
             curr_layer = obs[0]["current_layer"]  # Shape: (n_stack,) or (1, n_stack)
-            # target_layer = obs[0]["target_layer"]  # Shape: (n_stack,) or (1, n_stack)
+            persistent_target_layer = obs[0]["persistent_target_layer"]  # Shape: (1,) or (1, 1)
+            expirable_target_layer = obs[0]["expirable_target_layer"]  # Shape: (1,) or (1, 1)
 
         # Single fast check for both visual and position to remove batch dim
         # Remove any extra batch dimension from DummyVecEnv if present
@@ -1338,11 +1423,17 @@ class CustomVecTranspose(VecTransposeImage):
             if len(curr_layer.shape) == 0:
                 curr_layer = curr_layer.reshape(1)  # Ensure shape is (1,)
 
-        # if isinstance(target_layer, np.ndarray):
-        #     if len(target_layer.shape) > 1:
-        #         target_layer = target_layer[0]  # Convert (1, n_stack) to (n_stack,)
-        #     if len(target_layer.shape) == 0:
-        #         target_layer = target_layer.reshape(1)  # Ensure shape is (1,)
+        if isinstance(persistent_target_layer, np.ndarray):
+            if len(persistent_target_layer.shape) > 1:
+                persistent_target_layer = persistent_target_layer[0]  # Convert (1, 1) to (1,)
+            if len(persistent_target_layer.shape) == 0:
+                persistent_target_layer = persistent_target_layer.reshape(1)  # Ensure shape is (1,)
+
+        if isinstance(expirable_target_layer, np.ndarray):
+            if len(expirable_target_layer.shape) > 1:
+                expirable_target_layer = expirable_target_layer[0]  # Convert (1, 1) to (1,)
+            if len(expirable_target_layer.shape) == 0:
+                expirable_target_layer = expirable_target_layer.reshape(1)  # Ensure shape is (1,)
 
         # Convert from HWC to CHW format - only once and only if needed
         # Check if already in CHW format to avoid unnecessary transpose
@@ -1360,9 +1451,9 @@ class CustomVecTranspose(VecTransposeImage):
         return {
             "visual": visual_result,
             "position": position,
-            # "action_history": action_history,
             "current_layer": curr_layer,
-            # "target_layer": target_layer,
+            "persistent_target_layer": persistent_target_layer,
+            "expirable_target_layer": expirable_target_layer,
         }
 
 
@@ -1436,6 +1527,7 @@ def continue_training(model_path, additional_timesteps=100000, checkpoint_freq=1
 # Create environment pipeline
 def make_env():
     env = VisualSimulationEnv()
+    env = TimeLimit(env, max_episode_steps=100)
     env = Monitor(env)
     return env
 
@@ -1534,9 +1626,9 @@ class MemoryManagementCallback(BaseCallback):
 # Only run training code when script is executed directly (not imported)
 if __name__ == "__main__":
     # Training parameters
-    total_timesteps = 1000000
-    check_freq = 50000  # Save checkpoint every 50k steps
-    MODEL_TAG = "PPO_expirable_target_nn_Continuous"
+    total_timesteps = 5000000
+    check_freq = 100000  # Save checkpoint every 50k steps
+    MODEL_TAG = "PPO_expirable_target_nn_Continuous_v2"
 
     # Create environment with frame stacking
     n_stack = 4  # Stack 4 frames
@@ -1555,6 +1647,7 @@ if __name__ == "__main__":
         ),
         # Use a larger network to process the stacked frames
         net_arch=[256, 128, 64],
+        # net_arch=[256, 256],
     )
 
     # Initialize model
@@ -1656,7 +1749,7 @@ if __name__ == "__main__":
     if th.cuda.is_available():
         th.cuda.empty_cache()
 
-    # Save the final model
+    # Save the fdatetimeel
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     model.save(f"ppo_visual_attention_full_{timestamp}")
     print(f"Final model saved as ppo_visual_attention_full_{timestamp}")

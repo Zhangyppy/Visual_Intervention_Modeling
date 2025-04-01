@@ -4,6 +4,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import pygame
+from gymnasium.wrappers import TimeLimit
 import torch as th
 
 # Import the model and environment
@@ -28,6 +29,7 @@ STACKED_FRAMES = 4
 def create_simple_eval_env(render_mode="human"):
     """Creates a simple environment for human rendering without wrappers."""
     env = VisualSimulationEnv(render_mode=render_mode)
+    env = TimeLimit(env, max_episode_steps=100)
     env = Monitor(env)
     return env
 
@@ -55,11 +57,13 @@ def manual_evaluate(model, env, n_episodes=10):
         positions_history = [obs["position"]] * STACKED_FRAMES
         curr_layer_history = [obs["current_layer"]] * STACKED_FRAMES
         # target_layer_history = [obs["target_layer"]] * STACKED_FRAMES
+        persistent_target_layer_history = [obs["persistent_target_layer"]] * STACKED_FRAMES
+        expirable_target_layer_history = [obs["expirable_target_layer"]] * STACKED_FRAMES
 
         # Track previous target completion state to detect new completions
         prev_target_completed = False
 
-        while not (done or truncated) and step_count < 100:
+        while not (done or truncated):
             try:
                 # Stack frames and convert to CHW format
                 stacked_frames = []
@@ -71,6 +75,12 @@ def manual_evaluate(model, env, n_episodes=10):
                 stacked_position = np.concatenate(positions_history)
                 stacked_current_layer = np.concatenate(curr_layer_history)
                 # stacked_target_layer = np.concatenate(target_layer_history)
+                stacked_persistent_target_layer = np.concatenate(
+                    persistent_target_layer_history
+                )
+                stacked_expirable_target_layer = np.concatenate(
+                    expirable_target_layer_history
+                )
 
                 # Ensure correct data types
                 if stacked_visual.dtype != np.uint8:
@@ -81,12 +91,18 @@ def manual_evaluate(model, env, n_episodes=10):
                     stacked_current_layer = stacked_current_layer.astype(np.int8)
                 # if stacked_target_layer.dtype != np.int8:
                 #     stacked_target_layer = stacked_target_layer.astype(np.int8)
+                if stacked_persistent_target_layer.dtype != np.int8:
+                    stacked_persistent_target_layer = stacked_persistent_target_layer.astype(np.int8)
+                if stacked_expirable_target_layer.dtype != np.int8:
+                    stacked_expirable_target_layer = stacked_expirable_target_layer.astype(np.int8)
 
                 stacked_obs = {
                     "visual": stacked_visual,
                     "position": stacked_position,
                     "current_layer": stacked_current_layer,
                     # "target_layer": stacked_target_layer,
+                    "persistent_target_layer": stacked_persistent_target_layer,
+                    "expirable_target_layer": stacked_expirable_target_layer,
                 }
 
                 # Get and convert action
