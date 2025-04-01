@@ -31,9 +31,10 @@ class Target:
         current_steps (int): Current steps agent has spent on target
         completed (bool): Whether the target has been completed
         reward (float): Reward value when target is completed
-        expires (bool): Whether the target can expire
+        expirable (bool): Whether the target can expire
         max_lifetime (int): Maximum steps before target expires (if expires=True)
         lifetime (int): Current lifetime in steps
+        is_high_importance (bool): Whether the target is high importance
     """
 
     def __init__(
@@ -44,8 +45,9 @@ class Target:
         size=None,
         required_steps=1,
         reward=10,
-        expires=True,
+        expirable=True,
         max_lifetime=None,
+        is_high_importance=False,
     ):
         """
         Initialize a target.
@@ -89,11 +91,12 @@ class Target:
 
         # New properties
         self.reward = reward
-        self.expires = expires
+        self.expirable = expirable
         self.max_lifetime = (
             max_lifetime if max_lifetime is not None else 20
         )  # Default lifetime
         self.lifetime = 0
+        self.is_high_importance = is_high_importance
 
     def update_lifetime(self):
         """
@@ -102,7 +105,7 @@ class Target:
         Returns:
             bool: True if target has expired, False otherwise
         """
-        if not self.expires:
+        if not self.expirable:
             return False
 
         self.lifetime += 1

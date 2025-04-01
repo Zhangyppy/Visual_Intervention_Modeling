@@ -29,7 +29,7 @@ STACKED_FRAMES = 4
 def create_simple_eval_env(render_mode="human"):
     """Creates a simple environment for human rendering without wrappers."""
     env = VisualSimulationEnv(render_mode=render_mode)
-    env = TimeLimit(env, max_episode_steps=100)
+    env = TimeLimit(env, max_episode_steps=200)
     env = Monitor(env)
     return env
 
@@ -55,10 +55,14 @@ def manual_evaluate(model, env, n_episodes=10):
         # Initialize frame stacking with duplicate frames
         frames_history = [obs["visual"]] * STACKED_FRAMES
         positions_history = [obs["position"]] * STACKED_FRAMES
-        curr_layer_history = [obs["current_layer"]] * STACKED_FRAMES
+        # curr_layer_history = [obs["current_layer"]] * STACKED_FRAMES
         # target_layer_history = [obs["target_layer"]] * STACKED_FRAMES
-        persistent_target_layer_history = [obs["persistent_target_layer"]] * STACKED_FRAMES
-        expirable_target_layer_history = [obs["expirable_target_layer"]] * STACKED_FRAMES
+        persistent_target_layer_history = [
+            obs["persistent_target_layer"]
+        ] * STACKED_FRAMES
+        expirable_target_layer_history = [
+            obs["expirable_target_layer"]
+        ] * STACKED_FRAMES
 
         # Track previous target completion state to detect new completions
         prev_target_completed = False
@@ -73,7 +77,7 @@ def manual_evaluate(model, env, n_episodes=10):
 
                 stacked_visual = np.concatenate(stacked_frames, axis=0)
                 stacked_position = np.concatenate(positions_history)
-                stacked_current_layer = np.concatenate(curr_layer_history)
+                # stacked_current_layer = np.concatenate(curr_layer_history)
                 # stacked_target_layer = np.concatenate(target_layer_history)
                 stacked_persistent_target_layer = np.concatenate(
                     persistent_target_layer_history
@@ -87,19 +91,22 @@ def manual_evaluate(model, env, n_episodes=10):
                     stacked_visual = stacked_visual.astype(np.uint8)
                 if stacked_position.dtype != np.float32:
                     stacked_position = stacked_position.astype(np.float32)
-                if stacked_current_layer.dtype != np.int8:
-                    stacked_current_layer = stacked_current_layer.astype(np.int8)
+                # if stacked_current_layer.dtype != np.int8:
+                #     stacked_current_layer = stacked_current_layer.astype(np.int8)
                 # if stacked_target_layer.dtype != np.int8:
                 #     stacked_target_layer = stacked_target_layer.astype(np.int8)
                 if stacked_persistent_target_layer.dtype != np.int8:
-                    stacked_persistent_target_layer = stacked_persistent_target_layer.astype(np.int8)
+                    stacked_persistent_target_layer = (
+                        stacked_persistent_target_layer.astype(np.int8)
+                    )
                 if stacked_expirable_target_layer.dtype != np.int8:
-                    stacked_expirable_target_layer = stacked_expirable_target_layer.astype(np.int8)
+                    stacked_expirable_target_layer = (
+                        stacked_expirable_target_layer.astype(np.int8)
+                    )
 
                 stacked_obs = {
                     "visual": stacked_visual,
                     "position": stacked_position,
-                    "current_layer": stacked_current_layer,
                     # "target_layer": stacked_target_layer,
                     "persistent_target_layer": stacked_persistent_target_layer,
                     "expirable_target_layer": stacked_expirable_target_layer,
@@ -142,23 +149,23 @@ def manual_evaluate(model, env, n_episodes=10):
                 ):
                     prev_target_completed = False
 
-                # Track visits to persistent target
-                if hasattr(env, "persistent_target") and hasattr(env, "current_layer"):
-                    if (
-                        env.persistent_target.check_collision(
-                            env.agent_pos, AGENT_RADIUS
-                        )
-                        and env.current_layer == env.persistent_target.layer
-                    ):
-                        persistent_target_visits += 1
+                # # Track visits to persistent target
+                # if hasattr(env, "persistent_target") and hasattr(env, "current_layer"):
+                #     if (
+                #         env.persistent_target.check_collision(
+                #             env.agent_pos, AGENT_RADIUS
+                #         )
+                #         and env.current_layer == env.persistent_target.layer
+                #     ):
+                #         persistent_target_visits += 1
 
                 # Update frame history
                 frames_history.pop(0)
                 frames_history.append(next_obs["visual"])
                 positions_history.pop(0)
                 positions_history.append(next_obs["position"])
-                curr_layer_history.pop(0)
-                curr_layer_history.append(next_obs["current_layer"])
+                # curr_layer_history.pop(0)
+                # curr_layer_history.append(next_obs["current_layer"])
                 # target_layer_history.pop(0)
                 # target_layer_history.append(next_obs["target_layer"])
 
