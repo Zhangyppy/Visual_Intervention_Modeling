@@ -2,6 +2,7 @@ import datetime
 import gc
 import math
 from gymnasium import spaces
+from gymnasium.wrappers import TimeLimit
 import gymnasium as gym
 import numpy as np
 import pickle
@@ -10,6 +11,8 @@ import pygame
 import random
 import os
 import torch as th
+from cbam import CBAM
+from target import Target, LAYER_ENVIRONMENT, LAYER_NOTIFICATION
 
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.monitor import Monitor
@@ -37,15 +40,29 @@ WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 RED = (255, 0, 0)
 BLUE = (0, 0, 255)
+GREEN = (0, 255, 0)
+CYAN = (0, 255, 255)
+GREY = (128, 128, 128)
+LIGHT_GREY = (69, 69, 69)
+NOTIFICATION_COLORS = BLUE
+ENVIRONMENT_COLORS = GREEN
+BLUE_TEXTURE = (70, 70, 220)
+GREEN_TEXTURE = (0, 100, 0)
 
 # Constants
 AGENT_RADIUS = 5
-BLOCK_SIZE = 40
-MAX_MOVE_SPEED = 20  # Maximum speed for continuous actions
+ENVIRONMENT_BLOCK_SIZE = 40  # Size of block when on environment layer
+NOTIFICATION_BLOCK_SIZE = 60  # Size of block when on notification layer
+MAX_MOVE_SPEED = 30  # Maximum speed for continuous actions
 MIN_MOVE_SPEED = 5  # Minimum speed for movement when action is non-zero
-MIN_BLOCK_GENERATION_DISTANCE = (
-    50  # Minimum distance between agent and target to generate a block
-)
+MIN_BLOCK_GENERATION_DISTANCE = max(
+    NOTIFICATION_BLOCK_SIZE + 10, 60
+)  # Minimum distance between agent and target to generate a block
+BOUNDARY_PENALTY = 1  # Penalty for hitting the boundary
+COMPLETION_REWARD = 100  # Reward for completing all expirable targets
+
+LAYER_ENVIRONMENT = 0
+LAYER_NOTIFICATION = 1
 
 # Check if CUDA or MPS is available
 device = (
@@ -55,6 +72,8 @@ device = (
 )
 print(f"Using device: {device}")
 th.device(device)
+device = th.device(device)
+# th.set_default_device(device) if hasattr(th, "set_default_device") else None
 
 # _detect_oscillation parameters for tuning
 HISTORY_LENGTH = 10  # Track more positions for better pattern detection
@@ -69,23 +88,39 @@ LOCAL_MINIMUM_RADIUS = 0.15 * MAX_MOVE_SPEED  # Radius to detect if stuck in loc
 LOCAL_MIN_TIME_THRESHOLD = 8  # How many steps to be in local area to trigger
 TARGET_PROGRESS_THRESHOLD = 0.02 * SCREEN_WIDTH  # Progress toward target threshold
 COOLDOWN_STEPS = 5  # Steps to ignore oscillation detection after a trigger
+NUM_HIGH_IMPORTANCE_TARGETS = 2
+NUM_LOW_IMPORTANCE_TARGETS = 1
 
 
 class VisualSimulationEnv(gym.Env):
-    def __init__(self, render_mode=None):
+
+    def __init__(
+        self,
+        render_mode=None,
+        num_high_importance_targets=NUM_HIGH_IMPORTANCE_TARGETS,
+        num_low_importance_targets=NUM_LOW_IMPORTANCE_TARGETS,
+    ):
         super(VisualSimulationEnv, self).__init__()
 
         self.metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
         self.render_mode = render_mode
 
+        # Target configuration
+        self.num_high_importance_targets = num_high_importance_targets
+        self.num_low_importance_targets = num_low_importance_targets
+
         # --- ACTION SPACE ---
         # Changed from discrete to continuous action space
-        # Action is a 2D vector representing [x_direction, y_direction]
-        # Each value between -1 and 1, will be scaled by MAX_MOVE_SPEED
+        # Action is a 3D vector representing [x_direction, y_direction, layer]
+        # First two values between -1 and 1 for movement, last value between 0 and 1 for layer selection
+        # NOTE: The reason why the layer is not discrete is because the PPO do not support
+        #       spaces.Tuple, so we use continuous action space for layer selection
+        #       Then we use a threshold to convert the continuous action space to a discrete
+        #       action space
         self.action_space = spaces.Box(
-            low=np.array([-1, -1], dtype=np.float32),
-            high=np.array([1, 1], dtype=np.float32),
-            shape=(2,),
+            low=np.array([-1, -1, 0], dtype=np.float32),
+            high=np.array([1, 1, 1], dtype=np.float32),
+            shape=(3,),
             dtype=np.float32,
         )
 
@@ -93,8 +128,6 @@ class VisualSimulationEnv(gym.Env):
         # The observation is a dictionary containing both the visual observation and position information
         self.observation_space = spaces.Dict(
             {
-                # NOTE: We initialize with HWC format, which will be converted to CHW
-                # by the CustomVecTranspose wrapper
                 "visual": spaces.Box(
                     low=0,
                     high=255,
@@ -106,9 +139,9 @@ class VisualSimulationEnv(gym.Env):
                     dtype=np.uint8,
                 ),
                 "position": spaces.Box(
-                    low=np.array([0, 0], dtype=np.float32),
-                    high=np.array([SCREEN_WIDTH, SCREEN_HEIGHT], dtype=np.float32),
-                    shape=(2,),  # Agent's x, y position
+                    low=np.array([0, 0, 0], dtype=np.float32),
+                    high=np.array([SCREEN_WIDTH, SCREEN_HEIGHT, 1], dtype=np.float32),
+                    shape=(3,),  # Agent's x, y, z position (z is the layer)
                     dtype=np.float32,
                 ),
                 # "action_history": spaces.Box(
@@ -117,15 +150,52 @@ class VisualSimulationEnv(gym.Env):
                 #     shape=(10,),
                 #     dtype=np.uint8,
                 # ),
+                # "current_layer": spaces.Box(
+                #     low=np.array([0], dtype=np.int8),  # Environment layer
+                #     high=np.array([1], dtype=np.int8),  # Notification layer
+                #     shape=(
+                #         1,
+                #     ),  # Layer information as a float (0: environment, 1: notification)
+                #     dtype=np.int8,
+                # ),
+                "persistent_target_layer": spaces.Box(
+                    low=np.array([0], dtype=np.int8),
+                    high=np.array([1], dtype=np.int8),
+                    shape=(1,),
+                    dtype=np.int8,
+                ),
+                "expirable_target_layer": spaces.Box(
+                    low=np.array([-1], dtype=np.int8),  # -1 means no expirable target
+                    high=np.array([1], dtype=np.int8),
+                    shape=(1,),
+                    dtype=np.int8,
+                ),
             }
         )
 
         # --- Episode Variables ---
-        self._ep_length = 100  # Max episode length
         self._steps = 0  # Current step
+        self.max_expirable_targets = (
+            self.num_high_importance_targets
+        )  # Only high importance targets count for completion
+        self.completed_high_importance_targets = 0
+
+        # Target generation parameters
+        self.min_target_generation_gap = (
+            10  # Minimum steps between generating new expirable targets
+        )
+        self.target_generation_probability = (
+            0.4  # Probability of generating a new target when eligible
+        )
+        self.last_target_generation_step = 0  # Step when the last target was generated
+        self.pending_targets = []  # Queue of targets waiting to be activated
+        self.active_target = None  # Currently active expirable target
 
         # Initialize positions of agent and target
         self._initialize_positions()
+
+        # Initialize layer state
+        self.current_layer = LAYER_ENVIRONMENT  # Note: this assumes that the agent starts on the environment layer
 
         # Initialize pygame if in human render mode
         self.screen = None
@@ -133,6 +203,11 @@ class VisualSimulationEnv(gym.Env):
         if self.render_mode == "human":
             self._init_render()
 
+        # Initialize observation buffers
+        self._obs_canvas = None
+        self._visual_obs_buffer = None
+
+        # Initialize state tracking variables
         self.reward = 0
         self.reward_count = 0
         self.exploration_count = 0  # Track how many exploration rewards/penalties given
@@ -142,10 +217,9 @@ class VisualSimulationEnv(gym.Env):
         self.visited_positions = set()
         self.position_history = [self.agent_pos.copy()]
         self.target_distance_history = np.zeros(10, dtype=np.float32)
-        self.target_distance_history[0] = np.linalg.norm(
-            self.agent_pos - self.target_pos
-        )
+        self.target_distance_history[0] = 0
         self.oscillation_cooldown = 0
+        self.previous_layer = LAYER_ENVIRONMENT
 
     def _initialize_positions(self):
         """Initialize agent and target positions"""
@@ -157,23 +231,119 @@ class VisualSimulationEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # Place the target at a random position, but ensure it's not right on top of the agent
+        # Create the persistent target (never expires, lower reward)
+        self.persistent_target = self._create_random_target(
+            expires=False,
+            reward=5,
+            required_steps=1,
+            color=BLUE,
+            size=ENVIRONMENT_BLOCK_SIZE,
+            layer=LAYER_ENVIRONMENT,
+        )
+
+        # Pre-generate all expirable targets but keep them in a queue
+        self.pending_targets = []
+        self.active_target = None
+        self.completed_high_importance_targets = 0
+        self.last_target_generation_step = 0
+
+        # Generate low importance targets
+        for _ in range(self.num_low_importance_targets):
+            layer = random.randint(0, 1)
+            target = self._create_random_target(
+                expires=True,
+                reward=0.1,
+                required_steps=3,
+                max_lifetime=60,
+                color=GREY,
+                size=(
+                    NOTIFICATION_BLOCK_SIZE
+                    if layer == LAYER_NOTIFICATION
+                    else ENVIRONMENT_BLOCK_SIZE
+                ),
+                layer=layer,
+                is_high_importance=False,
+            )
+            self.pending_targets.append(target)
+
+        # Generate high importance targets
+        for _ in range(self.num_high_importance_targets):
+            layer = random.randint(0, 1)
+            target = self._create_random_target(
+                expires=True,
+                reward=20,
+                required_steps=3,
+                max_lifetime=60,
+                color=GREEN,
+                size=(
+                    NOTIFICATION_BLOCK_SIZE
+                    if layer == LAYER_NOTIFICATION
+                    else ENVIRONMENT_BLOCK_SIZE
+                ),
+                layer=layer,
+                is_high_importance=True,
+            )
+            self.pending_targets.append(target)
+
+        # Shuffle all targets to randomize order
+        random.shuffle(self.pending_targets)
+
+    def _create_random_target(
+        self,
+        expires=True,
+        reward=40,
+        required_steps=3,
+        max_lifetime=30,
+        size=None,
+        color=None,
+        layer=None,
+        is_high_importance=False,
+    ):
+        """
+        Create a random target with specified properties
+        Place the target at a random position, but ensure it's not right on top of the agent
+        """
         while True:
-            self.target_pos = np.array(
+            target_pos = np.array(
                 [
-                    random.randint(BLOCK_SIZE // 2, SCREEN_WIDTH - BLOCK_SIZE // 2),
-                    random.randint(BLOCK_SIZE // 2, SCREEN_HEIGHT - BLOCK_SIZE // 2),
+                    random.randint(
+                        size // 2,
+                        SCREEN_WIDTH - size // 2,
+                    ),
+                    random.randint(
+                        size // 2,
+                        SCREEN_HEIGHT - size // 2,
+                    ),
                 ],
                 dtype=np.float32,
             )
 
-            # Make sure the target is not too close to the agent at initialization
+            # Make sure the target is not too close to the agent
             # NOTE: beware if we scale down the screen size, this value needs to be scaled down as well
             if (
-                np.linalg.norm(self.agent_pos - self.target_pos)
+                np.linalg.norm(self.agent_pos - target_pos)
                 > MIN_BLOCK_GENERATION_DISTANCE
             ):
-                break
+                # If we already have a persistent target, also ensure the new target isn't too close to it
+                if (
+                    not hasattr(self, "persistent_target")
+                    or np.linalg.norm(self.persistent_target.pos - target_pos)
+                    > MIN_BLOCK_GENERATION_DISTANCE
+                ):
+                    break
+
+        # Create the target with provided settings
+        return Target(
+            pos=target_pos,
+            required_steps=required_steps,
+            reward=reward,
+            expirable=expires,
+            max_lifetime=max_lifetime,
+            size=size,
+            color=color,
+            layer=layer,
+            is_high_importance=is_high_importance,
+        )
 
     def _init_render(self):
         pygame.init()
@@ -181,31 +351,41 @@ class VisualSimulationEnv(gym.Env):
         pygame.display.set_caption("Visual Attention Task")
         self.clock = pygame.time.Clock()
 
-    def reset(self, seed=None):
+    def reset(self, seed=None, options=None):
+        """Reset the environment to initial state.
+
+        Args:
+            seed: Random seed for reproducibility
+            options: Additional options for reset (compatibility with newer Gymnasium versions)
+
+        Returns:
+            tuple: (observation, info)
+        """
         # We need the following line to seed self.np_random
         super().reset(seed=seed)
 
         # Reset positions
         self._initialize_positions()
 
+        # Reset state tracking variables
         self.reward = 0
         self._steps = 0
         self.exploration_count = 0
         self.reward_count = 0
+        self.completed_high_importance_targets = 0
+        self.last_target_generation_step = 0
         self.action_history = np.full(
             10, 255, dtype=np.uint8
         )  # Reset action history with 255 (no action)
         self.position_history = [self.agent_pos.copy()]
         self.target_distance_history = np.zeros(10, dtype=np.float32)
+        # Initialize target_distance_history with distance to persistent target
         self.target_distance_history[0] = np.linalg.norm(
-            self.agent_pos - self.target_pos
+            self.agent_pos - self.persistent_target.pos
         )
         self.oscillation_cooldown = 0
         self.visited_positions = set()
-
-        # Update cached target boundaries for observation rendering
-        if hasattr(self, "_cached_target_boundaries"):
-            self._cached_target_boundaries = self._get_target_boundaries()
+        self.current_layer = LAYER_ENVIRONMENT
 
         # Process and handle events to avoid pygame becoming unresponsive
         if self.render_mode == "human":
@@ -215,32 +395,15 @@ class VisualSimulationEnv(gym.Env):
 
         return self._get_obs(), {}
 
-    def _get_target_boundaries(self):
-        """
-        Calculate the target boundaries
-        Returns:
-            tuple: (x_min, y_min, x_max, y_max) of target boundaries
-        """
-        x_min = int(self.target_pos[0] - BLOCK_SIZE // 2)
-        y_min = int(self.target_pos[1] - BLOCK_SIZE // 2)
-        x_max = x_min + BLOCK_SIZE
-        y_max = y_min + BLOCK_SIZE
-        return x_min, y_min, x_max, y_max
-
-    def _check_collision(self):
-        """Check if the agent collides with the target"""
-        # Calculate the center of the target
-        target_center = self.target_pos
-
-        # Check if the distance between the agent's center and the target's center
-        # is less than the sum of the agent's radius and half the target size
-        distance = np.linalg.norm(self.agent_pos - target_center)
-        return distance < (AGENT_RADIUS + BLOCK_SIZE / 2)
+    # def _check_collision(self):
+    #     """Check if the agent collides with the target"""
+    #     return self.target.check_collision(self.agent_pos, AGENT_RADIUS)
 
     def _detect_oscillation(self, action):
         """
         Enhanced oscillation detection that handles both local minimum (not moving enough)
         and looping behavior patterns.
+        NOTE: outdated
         """
         # Skip detection during initial steps or during cooldown
         if self._steps < HISTORY_LENGTH:
@@ -258,7 +421,14 @@ class VisualSimulationEnv(gym.Env):
             self.oscillation_cooldown = 0
 
         # Update distance to target history
-        current_target_distance = np.linalg.norm(self.agent_pos - self.target_pos)
+        if self.active_target:
+            current_target_distance = np.linalg.norm(
+                self.agent_pos - self.active_target.pos
+            )
+        else:
+            current_target_distance = np.linalg.norm(
+                self.agent_pos - self.persistent_target.pos
+            )
 
         if not hasattr(self, "target_distance_history"):
             self.target_distance_history = np.zeros(HISTORY_LENGTH, dtype=np.float32)
@@ -302,7 +472,7 @@ class VisualSimulationEnv(gym.Env):
                 target_progress < TARGET_PROGRESS_THRESHOLD
                 and
                 # Agent is actively trying to move (non-zero action)
-                np.any(np.abs(action) > 0.2)
+                np.any(np.abs(action[:2]) > 0.2)
             )
 
             if local_minimum_detected:
@@ -393,17 +563,26 @@ class VisualSimulationEnv(gym.Env):
                     pygame.quit()
 
         self._steps += 1
-        done = False
+        terminated = False
 
-        # Update action history
+        # Extract movement and layer actions from the combined action vector
+        movement_action = action[:2]  # First two components for movement
+        layer_action = action[2]  # Last component for layer selection
+
+        # Convert layer_action from continuous [0,1] to discrete [0, 1]
+        self.current_layer = (
+            LAYER_ENVIRONMENT if layer_action < 0.5 else LAYER_NOTIFICATION
+        )
+
+        # Update movement action history
         self.action_history = np.roll(self.action_history, 1)
         self.action_history[0] = int(
-            np.argmax(np.abs(action))
+            np.argmax(np.abs(movement_action))
         )  # Store strongest direction for history
 
         # Normalize and scale the action vector
         # Actions are in range [-1, 1], scale them by MAX_MOVE_SPEED
-        action_vector = np.array(action, dtype=np.float32)
+        action_vector = np.array(movement_action, dtype=np.float32)
         vector_magnitude = np.linalg.norm(action_vector)
 
         # Normalize only if the magnitude is not zero to avoid division by zero
@@ -419,13 +598,13 @@ class VisualSimulationEnv(gym.Env):
         # Calculate the intended (unclipped) position
         intended_pos = self.agent_pos + move_vector
 
-        # Check if the intended position would be outside the screen boundaries
-        hit_boundary = (
-            intended_pos[0] <= AGENT_RADIUS
-            or intended_pos[0] >= SCREEN_WIDTH - AGENT_RADIUS
-            or intended_pos[1] <= AGENT_RADIUS
-            or intended_pos[1] >= SCREEN_HEIGHT - AGENT_RADIUS
-        )
+        # # Check if the intended position would be outside the screen boundaries
+        # hit_boundary = (
+        #     intended_pos[0] <= AGENT_RADIUS
+        #     or intended_pos[0] >= SCREEN_WIDTH - AGENT_RADIUS
+        #     or intended_pos[1] <= AGENT_RADIUS
+        #     or intended_pos[1] >= SCREEN_HEIGHT - AGENT_RADIUS
+        # )
 
         # Clip the agent position to the screen boundaries
         self.agent_pos = np.clip(
@@ -443,48 +622,22 @@ class VisualSimulationEnv(gym.Env):
         # --- Reward Structure ---
         reward = -0.1
 
-        # Boundary penalty
-        if hit_boundary:
-            reward -= 10
+        # Check collisions and update targets
+        reward += self._handle_target_interactions()
 
-        # Terminal reward for reaching target
-        if self._check_collision():
-            reward += 200  # Big reward for reaching target
-            self.reward_count += 1
-            if self.reward_count >= 3:
-                done = True
+        # # Layer switching confidence
+        # layer_confidence = abs(layer_action - 0.5) * 2  # Maps [0,0.5] to [0,1]
+        # confidence_reward = 0.1 * layer_confidence
+        # reward += confidence_reward
 
-        # Reward for exploring (changing actions)
-        # NOTE: disabled for now because its not working well on continuous actions
-        # Check for oscillation patterns in action history
-        if not self._detect_oscillation(action):
-            if len(self.position_history) > 3:
-                recent_movement = self.agent_pos - self.position_history[0]
-                recent_movement_norm = np.linalg.norm(recent_movement)
+        # Update target lifetimes and generate new targets if needed
+        self._update_expirable_targets()
 
-                if recent_movement_norm > MIN_MOVE_SPEED:
-                    # Normalize the movement vector (only once)
-                    recent_dir = recent_movement / recent_movement_norm
-
-                    # Check if the direction has changed
-                    direction_changed = False
-                    for i in range(1, min(3, len(self.position_history) - 1)):
-                        prev_movement = (
-                            self.position_history[i - 1] - self.position_history[i]
-                        )
-                        prev_movement_norm = np.linalg.norm(prev_movement)
-
-                        if prev_movement_norm > MIN_MOVE_SPEED:
-                            prev_dir = prev_movement / prev_movement_norm
-                            # If dot product is less than threshold, directions are different
-                            if np.dot(recent_dir, prev_dir) < 0.8:  # Not too similar
-                                direction_changed = True
-                                break
-
-                    if direction_changed:
-                        reward += 0.2
-        else:
-            reward -= 0.5
+        # Termination for completing all high importance expirable targets
+        if self.completed_high_importance_targets >= self.max_expirable_targets:
+            terminated = True
+            reward += COMPLETION_REWARD
+            self.reward += COMPLETION_REWARD
 
         # Reward for exploring new positions, use discretized position for our convience
         # Discretize position to track visited areas
@@ -495,36 +648,180 @@ class VisualSimulationEnv(gym.Env):
         if grid_pos not in self.visited_positions:
             self.visited_positions.add(grid_pos)
             # diminishing reward for finding new positions
-            reward += 0.5 * math.exp(len(self.visited_positions) * -0.05)
+            reward += 1 * math.exp(len(self.visited_positions) * -0.1)
 
-        # Check if episode is done due to step limit
-        if self._steps >= self._ep_length:
-            done = True
+        # if hit_boundary:
+        #     reward = 0
+        #     reward -= BOUNDARY_PENALTY
 
         # Store the reward for rendering purposes
         self.reward += reward
 
-        return self._get_obs(), reward, done, False, {}
+        # Update previous layer
+        self.previous_layer = self.current_layer
+
+        return self._get_obs(), reward, terminated, False, {}
+
+    def _is_agent_switched_layer(self):
+        return self.previous_layer != self.current_layer
+
+    def _handle_target_interactions(self):
+        """Handle interactions with persistent and active expirable target"""
+        reward = 0
+
+        # Check persistent target first
+        if self.persistent_target.check_collision(self.agent_pos, AGENT_RADIUS):
+            # # small reward for agent exploring new layer
+            # if self._is_agent_switched_layer():
+            #     reward += self.persistent_target.reward / 10
+
+            agent_on_correct_layer = self.current_layer == self.persistent_target.layer
+            if agent_on_correct_layer:
+                # Always give reward for persistent target (lower reward)
+                reward += self.persistent_target.reward
+            # else:
+            #     reward -= self.persistent_target.reward / 3
+
+        # Check active expirable target if it exists
+        if self.active_target and self.active_target.check_collision(
+            self.agent_pos, AGENT_RADIUS
+        ):
+            # # small reward for agent exploring new layer
+            # if self._is_agent_switched_layer():
+            #     reward += 0.5
+
+            # Check if agent is on the correct layer
+            agent_on_correct_layer = self.current_layer == self.active_target.layer
+            target_completed = self.active_target.update_progress(
+                True, agent_on_correct_layer
+            )
+
+            if agent_on_correct_layer:
+                reward += self.active_target.reward
+                self.reward_count += 1
+            # else:
+            #     reward -= self.expirable_target.reward / 3
+
+            # If target completed, give extra reward and mark that the target was completed
+            if target_completed:
+                reward += (
+                    self.active_target.reward
+                )  # extra reward for completing the target
+
+                # Only increment completion counter for high importance targets
+                if (
+                    hasattr(self.active_target, "is_high_importance")
+                    and self.active_target.is_high_importance
+                ):
+                    self.completed_high_importance_targets += 1
+
+                # Mark the time when the target was completed
+                self.last_target_generation_step = self._steps
+                # Clear the active target (next one will be activated after time delay)
+                self.active_target = None
+        elif self.active_target:
+            # Update target progress (not on target)
+            self.active_target.update_progress(False, False)
+
+        return reward
+
+    def _update_expirable_targets(self):
+        """Update active expirable target lifetime and potentially activate a new one"""
+        # Update existing active target
+        if self.active_target and self.active_target.update_lifetime():
+            # Target expired, mark the time
+            self.last_target_generation_step = self._steps
+            self.active_target = None
+
+        # Check if we should activate a new target
+        if not self.active_target and self.pending_targets:
+            # Calculate time since last target was completed or expired
+            steps_since_last = self._steps - self.last_target_generation_step
+
+            # Only consider activating if enough time has passed
+            if steps_since_last >= self.min_target_generation_gap:
+                # Use random chance to decide whether to activate a new target
+                if random.random() < self.target_generation_probability:
+                    self.active_target = self.pending_targets.pop(0)
+                    self.last_target_generation_step = self._steps
+
+    def _draw_target(self, surface, target: Target, is_render_mode=False):
+        """
+        Helper method to draw a target on a surface
+
+        Args:
+            surface: pygame surface to draw on
+            target: Target object to draw
+            is_render_mode: Whether this is being called from render mode (affects line thickness)
+        """
+        # Draw the target block
+        target_x_min, target_y_min, _, _ = target.boundaries
+        pygame.draw.rect(
+            surface,
+            target.color,
+            (
+                target_x_min,
+                target_y_min,
+                target.size,
+                target.size,
+            ),
+        )
+
+        # Add texture to the target
+        line_spacing = target.size // 4
+        line_thickness = 3
+
+        if target.layer == LAYER_ENVIRONMENT:
+            # Horizontal lines for environment targets
+            for i in range(1, 4):
+                pygame.draw.line(
+                    surface,
+                    target.texture,
+                    (target_x_min, target_y_min + i * line_spacing),
+                    (target_x_min + target.size, target_y_min + i * line_spacing),
+                    line_thickness,
+                )
+        else:  # LAYER_NOTIFICATION
+            # Vertical lines for notification targets
+            for i in range(1, 4):
+                pygame.draw.line(
+                    surface,
+                    target.texture,
+                    (target_x_min + i * line_spacing, target_y_min),
+                    (target_x_min + i * line_spacing, target_y_min + target.size),
+                    line_thickness,
+                )
+
+        if target.expirable:
+            # if the target is expirable, draw a border around it
+            pygame.draw.rect(
+                surface,
+                CYAN,
+                (target_x_min, target_y_min, target.size, target.size),
+                5,
+            )
 
     def _get_obs(self):
         # Create a canvas for the full screen observation or reuse existing one
-        if not hasattr(self, "_obs_canvas"):
+        if not hasattr(self, "_obs_canvas") or self._obs_canvas is None:
             self._obs_canvas = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
-
             self._visual_obs_buffer = np.empty(
                 (SCREEN_HEIGHT, SCREEN_WIDTH, 3), dtype=np.uint8
             )
-            self._cached_target_boundaries = self._get_target_boundaries()
 
         # Reuse canvas to avoid memory allocation each time
         canvas = self._obs_canvas
-        canvas.fill(WHITE)
+        if self.current_layer == LAYER_ENVIRONMENT:
+            canvas.fill(WHITE)
+        else:
+            canvas.fill(LIGHT_GREY)
 
-        # Draw the blue target block using cached boundaries
-        target_x_min, target_y_min, _, _ = self._cached_target_boundaries
-        pygame.draw.rect(
-            canvas, BLUE, (target_x_min, target_y_min, BLOCK_SIZE, BLOCK_SIZE)
-        )
+        # Draw the persistent target
+        self._draw_target(canvas, self.persistent_target)
+
+        # Draw active expirable target if it exists
+        if self.active_target:
+            self._draw_target(canvas, self.active_target)
 
         # Draw the red agent
         pygame.draw.circle(canvas, RED, self.agent_pos.astype(int), AGENT_RADIUS)
@@ -538,12 +835,23 @@ class VisualSimulationEnv(gym.Env):
             np.transpose(self._visual_obs_buffer, (1, 0, 2)), canvas
         )
 
+        persistent_layer = np.array([self.persistent_target.layer], dtype=np.int8)
+        if self.active_target:
+            expirable_layer = np.array([self.active_target.layer], dtype=np.int8)
+        else:
+            expirable_layer = np.array([-1], dtype=np.int8)
+
+        # 3D position vector with layer as z-coordinate
+        position_3d = np.zeros(3, dtype=np.float32)
+        position_3d[:2] = self.agent_pos.astype(np.float32)  # x, y coordinates
+        position_3d[2] = float(self.current_layer)  # z coordinate (layer)
+
         # Return both visual observation and position information
         return {
             "visual": self._visual_obs_buffer,
-            "position": self.agent_pos.astype(np.float32),
-            # "action_history": self.action_history,
-            # "target": self.target_pos.astype(np.float32)
+            "position": position_3d,
+            "persistent_target_layer": persistent_layer,
+            "expirable_target_layer": expirable_layer,
         }
 
     def render(self, mode="human"):
@@ -579,13 +887,17 @@ class VisualSimulationEnv(gym.Env):
     def _render_frame(self):
         """Render the full environment to the screen"""
         # Fill the background
-        self.screen.fill(WHITE)
+        if self.current_layer == LAYER_ENVIRONMENT:
+            self.screen.fill(WHITE)
+        else:
+            self.screen.fill(LIGHT_GREY)
 
-        # Draw the blue target block
-        target_x_min, target_y_min, _, _ = self._get_target_boundaries()
-        pygame.draw.rect(
-            self.screen, BLUE, (target_x_min, target_y_min, BLOCK_SIZE, BLOCK_SIZE)
-        )
+        # Draw the persistent target
+        self._draw_target(self.screen, self.persistent_target, is_render_mode=True)
+
+        # Draw active expirable target if it exists
+        if self.active_target:
+            self._draw_target(self.screen, self.active_target, is_render_mode=True)
 
         # Draw the red agent
         pygame.draw.circle(self.screen, RED, self.agent_pos.astype(int), AGENT_RADIUS)
@@ -593,72 +905,109 @@ class VisualSimulationEnv(gym.Env):
         # draw the space boundaries outer boundary
         pygame.draw.rect(self.screen, BLACK, (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT), 5)
 
-        # Draw text info
-        font = pygame.font.SysFont("Arial", 14)
-
-        # Display step count
-        steps_text = font.render(f"Steps: {self._steps}/{self._ep_length}", True, BLACK)
-        self.screen.blit(steps_text, (10, 10))
-
-        # Display distance
-        distance = np.linalg.norm(self.agent_pos - self.target_pos)
-        distance_text = font.render(f"Distance: {distance:.1f}", True, BLACK)
-        self.screen.blit(distance_text, (10, 30))
-
-        # Display reward
-        reward = self.reward
-        reward_text = font.render(f"Cumulative Reward: {reward:.2f}", True, BLACK)
-        self.screen.blit(reward_text, (10, 50))
-
-        # Display last four actions and exploration info
-        action_names = {
-            0: "Up",
-            1: "Right",
-            2: "Down",
-            3: "Left",
-            None: "None",
-            255: "None",
-        }
-
-        # Get the last 4 actions from action history if available
-        action_history = []
-        if hasattr(self, "action_history"):
-            action_history = (
-                self.action_history[-4:] if len(self.action_history) > 0 else []
-            )
-        else:
-            # Fallback to last and second last if action_history not available
-            if hasattr(self, "last_action"):
-                action_history.append(self.last_action)
-            if hasattr(self, "second_last_action"):
-                action_history.insert(0, self.second_last_action)
-
-        # Pad with None if we have fewer than 4 actions
-        while len(action_history) < 4:
-            action_history.insert(0, None)
-
-        # Convert to action names
-        action_history_names = [action_names.get(a, str(a)) for a in action_history]
-
-        # Display the action history
-        history_text = font.render(
-            f"Recent actions: {' → '.join(action_history_names)}",
-            True,
-            BLACK,
-        )
-        self.screen.blit(history_text, (10, 70))
-
-        # Display exploration count
-        exploration_text = font.render(
-            f"Explored: {self.exploration_count}",
-            True,
-            BLACK,
-        )
-        self.screen.blit(exploration_text, (10, 90))
-
         # Return the screen as a numpy array if needed
         if self.render_mode == "rgb_array":
             return pygame.surfarray.array3d(self.screen).transpose(1, 0, 2)
+
+        # Draw text info only in human render mode
+        if self.render_mode == "human":
+            font = pygame.font.SysFont("Arial", 14)
+
+            # Display step count
+            steps_text = font.render(f"Steps: {self._steps}", True, BLACK)
+            self.screen.blit(steps_text, (10, 10))
+
+            # Display reward
+            reward = self.reward
+            reward_text = font.render(f"Cumulative Reward: {reward:.2f}", True, BLACK)
+            self.screen.blit(reward_text, (10, 30))
+
+            # Display current layer
+            layer_text = font.render(
+                f"Layer: {'Environment' if self.current_layer == LAYER_ENVIRONMENT else 'Notification'}",
+                True,
+                BLACK,
+            )
+            self.screen.blit(layer_text, (10, 50))
+
+            # Display last four actions and exploration info
+            action_names = {
+                0: "Up",
+                1: "Right",
+                2: "Down",
+                3: "Left",
+                None: "None",
+                255: "None",
+            }
+
+            # Get the last 4 actions from action history if available
+            action_history = []
+            if hasattr(self, "action_history"):
+                action_history = (
+                    self.action_history[-4:] if len(self.action_history) > 0 else []
+                )
+            else:
+                # Fallback to last and second last if action_history not available
+                if hasattr(self, "last_action"):
+                    action_history.append(self.last_action)
+                if hasattr(self, "second_last_action"):
+                    action_history.insert(0, self.second_last_action)
+
+            # Pad with None if we have fewer than 4 actions
+            while len(action_history) < 4:
+                action_history.insert(0, None)
+
+            # Convert to action names
+            action_history_names = [action_names.get(a, str(a)) for a in action_history]
+
+            # Display the action history
+            history_text = font.render(
+                f"Recent actions: {' → '.join(action_history_names)}",
+                True,
+                BLACK,
+            )
+            self.screen.blit(history_text, (10, 70))
+
+            # Display exploration count
+            exploration_text = font.render(
+                f"Explored: {self.exploration_count}",
+                True,
+                BLACK,
+            )
+            self.screen.blit(exploration_text, (10, 90))
+
+            # Display target info
+            high_importance_completed = self.completed_high_importance_targets
+            high_importance_total = self.num_high_importance_targets
+            targets_text = font.render(
+                f"Targets: {high_importance_completed}/{high_importance_total} (high importance)",
+                True,
+                BLACK,
+            )
+            self.screen.blit(targets_text, (10, 110))
+
+            # Display current active target info
+            if self.active_target:
+                active_text = font.render(
+                    f"Active target: {'High' if self.active_target.is_high_importance else 'Low'} importance, Layer: {'Environment' if self.active_target.layer == LAYER_ENVIRONMENT else 'Notification'}",
+                    True,
+                    BLACK,
+                )
+            else:
+                active_text = font.render(
+                    f"No active target",
+                    True,
+                    BLACK,
+                )
+            self.screen.blit(active_text, (10, 130))
+
+            # Display remaining targets
+            remaining_text = font.render(
+                f"Pending targets: {len(self.pending_targets)}",
+                True,
+                BLACK,
+            )
+            self.screen.blit(remaining_text, (10, 150))
 
     def close(self):
         """
@@ -684,6 +1033,14 @@ class VisualSimulationEnv(gym.Env):
 
         if hasattr(self, "target_distance_history"):
             self.target_distance_history = None
+
+        # Clear visited positions
+        if hasattr(self, "visited_positions"):
+            self.visited_positions.clear()
+
+        # Clear action history
+        if hasattr(self, "action_history"):
+            self.action_history = None
 
 
 class CoordConv(th.nn.Module):
@@ -732,7 +1089,7 @@ class CoordConv(th.nn.Module):
         )
 
         # Move to the same device as input
-        coords = th.cat([y_coords, x_coords], dim=1).to(x.device)
+        coords = th.cat([x_coords, y_coords], dim=1).to(x.device)
 
         # Add radial distance channel if requested
         if self.with_r:
@@ -753,6 +1110,7 @@ class VisionExtractor(BaseFeaturesExtractor):
         features_dim: int = 256,
         input_channels=None,
         resize_to=None,
+        n_stack=1,
     ):
         # Initialize with the visual part of the observation space
         super().__init__(observation_space, features_dim)
@@ -782,6 +1140,12 @@ class VisionExtractor(BaseFeaturesExtractor):
                 n_input_channels = visual_space.shape[2]
 
         pos_dim = observation_space["position"].shape[0]
+        persistent_target_layer_dim = observation_space[
+            "persistent_target_layer"
+        ].shape[0]
+        expirable_target_layer_dim = observation_space["expirable_target_layer"].shape[
+            0
+        ]
         # action_history_dim = observation_space["action_history"].shape[0]
 
         print(f"Initializing CNN with {n_input_channels} input channels")
@@ -798,28 +1162,69 @@ class VisionExtractor(BaseFeaturesExtractor):
                     x, size=resize_to, mode="bilinear", align_corners=False
                 )
 
+        """
+        CNN overhual plan:
+        Why update the CNN architecture?
+        1. Increase initial kernel from 3x3 to 7x7 (from 9 pixels to 49 pixels)
+            Our images are quite large and sometimes we even stack multiple frames. 
+            Thus a larger kernel can enlarges receptive field to capture broader spatial patterns
+            maybe it also helps detection of motion across stacked frames
+        2. Implemente graduated kernel sizing (7→5→3→3)
+            hierarchical feature extraction (global→local)
+            more like biological vision processing
+        3. Add more padding to final conv layer
+            prevents information loss at image boundaries (reduces tunnel vision!!!! We have very serious tunnel vision problem)
+
+        Downside? Its much slower than before. Others? We need to test it out.
+        """
         self.cnn = th.nn.Sequential(
-            # th.nn.Conv2d(n_input_channels, 32, 8, stride=4),
+            # # th.nn.Conv2d(n_input_channels, 32, 8, stride=4),
+            # CoordConv(
+            #     # th.nn.Conv2d(
+            #     n_input_channels,
+            #     output_channels=8,
+            #     kernel_size=(5, 5),
+            #     stride=(2, 2),
+            #     padding=(3, 3),
+            # ),
+            # th.nn.LeakyReLU(),
+            # # CBAM(gate_channels=8, reduction_ratio=2),
+            # th.nn.Conv2d(
+            #     in_channels=8,
+            #     out_channels=16,
+            #     kernel_size=(3, 3),
+            #     padding=(1, 1),
+            #     stride=(2, 2),
+            # ),
+            # th.nn.LeakyReLU(),
+            # th.nn.Conv2d(
+            #     in_channels=16,
+            #     out_channels=32,
+            #     kernel_size=(3, 3),
+            #     padding=(1, 1),
+            #     stride=(2, 2),
+            # ),
+            # th.nn.LeakyReLU(),
+            # th.nn.Flatten(),
             CoordConv(
-                # th.nn.Conv2d(
                 n_input_channels,
-                out_channels=8,
-                kernel_size=(3, 3),
+                output_channels=16,
+                kernel_size=(7, 7),
                 stride=(2, 2),
-                padding=(1, 1),
-            ),
-            th.nn.LeakyReLU(),
-            th.nn.Conv2d(
-                in_channels=8,
-                out_channels=16,
-                kernel_size=(3, 3),
-                padding=(1, 1),
-                stride=(2, 2),
+                padding=(3, 3),
             ),
             th.nn.LeakyReLU(),
             th.nn.Conv2d(
                 in_channels=16,
                 out_channels=32,
+                kernel_size=(5, 5),
+                padding=(2, 2),
+                stride=(2, 2),
+            ),
+            th.nn.LeakyReLU(),
+            th.nn.Conv2d(
+                in_channels=32,
+                out_channels=64,
                 kernel_size=(3, 3),
                 padding=(1, 1),
                 stride=(2, 2),
@@ -868,61 +1273,60 @@ class VisionExtractor(BaseFeaturesExtractor):
             n_flatten = self.cnn(resized_sample).shape[1]
             print(f"Flattened features size: {n_flatten}")
 
-        # Create a network for processing position data
-        self.pos_net = th.nn.Sequential(th.nn.Linear(pos_dim, 64), th.nn.ReLU())
+        # Create a network for processing position data (with frame stacking)
+        # Updated to handle 3D position (x, y, layer)
+        self.pos_net = th.nn.Sequential(
+            th.nn.Linear(pos_dim, 64),
+            th.nn.ReLU(),
+            th.nn.Linear(64, 32),
+            th.nn.ReLU(),
+        )
+        print(
+            f"Position network output size: {self.pos_net(th.zeros((1, pos_dim))).shape}"
+        )
 
-        # Create a network for processing action history
-        # self.action_history_net = th.nn.Sequential(
-        #     th.nn.Linear(action_history_dim, 32), th.nn.ReLU()
+        # Create a network for processing layer data (binary input with frame stacking)
+        # self.curr_layer_net = th.nn.Sequential(
+        #     th.nn.Linear(layer_dim, 32),
+        #     th.nn.ReLU(),
+        #     th.nn.Linear(32, 16),
+        #     th.nn.ReLU(),
         # )
+        # print(
+        #     f"Layer network output size: {self.curr_layer_net(th.zeros((1, layer_dim))).shape}"
+        # )
+
+        self.persistent_target_layer_net = th.nn.Sequential(
+            th.nn.Linear(persistent_target_layer_dim, 16),
+            th.nn.ReLU(),
+        )
+
+        self.expirable_target_layer_net = th.nn.Sequential(
+            th.nn.Linear(expirable_target_layer_dim, 16),
+            th.nn.ReLU(),
+        )
 
         # Final layer to combine all features
-        # self.combined = th.nn.Sequential(
-        #     th.nn.Linear(n_flatten + 64 + 32, features_dim), th.nn.ReLU()
-        # )
-
         self.combined = th.nn.Sequential(
-            # th.nn.Linear(n_flatten + 64, features_dim),
-            # th.nn.LayerNorm(features_dim),
-            # th.nn.ReLU(),
-            th.nn.Linear(n_flatten + 64, features_dim),
+            th.nn.Linear(
+                n_flatten + 32 + 16 + 16, features_dim
+            ),  # 32 for position features, 16 for each target layer features
             th.nn.ReLU(),
         )
 
     def forward(self, observations: dict) -> th.Tensor:
+        device = next(self.parameters()).device
+
         # Process visual features (already in CHW format from CustomVecTranspose)
         # Note: we only convert to tensor once if not already a tensor
         if isinstance(observations["visual"], th.Tensor):
-            visual_obs = observations["visual"]
-            if visual_obs.dtype != th.float32:
-                # Convert in place if possible
-                visual_obs = visual_obs.to(dtype=th.float32, non_blocking=True)
+            visual_obs = observations["visual"].to(
+                device, dtype=th.float32, non_blocking=True
+            )
         else:
-            # Pin memory if using CUDA for faster host-to-device transfer
-            if th.cuda.is_available():
-                # Reuse buffer if possible to reduce memory allocations
-                if (
-                    not hasattr(self, "_visual_tensor_buffer")
-                    or self._visual_tensor_buffer.shape[1:]
-                    != observations["visual"].shape
-                ):
-                    shape = observations["visual"].shape
-                    self._visual_tensor_buffer = th.empty(
-                        (1,) + shape if len(shape) == 3 else shape,
-                        dtype=th.float32,
-                        device="cuda",
-                    )
-
-                # Copy directly into the buffer
-                visual_obs = self._visual_tensor_buffer
-                visual_obs.copy_(
-                    th.as_tensor(
-                        observations["visual"], dtype=th.float32, device="cuda"
-                    ),
-                    non_blocking=True,
-                )
-            else:
-                visual_obs = th.as_tensor(observations["visual"], dtype=th.float32)
+            visual_obs = th.as_tensor(
+                observations["visual"], dtype=th.float32, device=device
+            )
 
         # Add batch dimension (CHW -> NCHW)
         if visual_obs.dim() == 3:
@@ -936,37 +1340,64 @@ class VisionExtractor(BaseFeaturesExtractor):
 
         # Process position features
         if isinstance(observations["position"], th.Tensor):
-            pos_obs = observations["position"]
-            if pos_obs.dtype != th.float32:
-                # Convert in place if possible
-                pos_obs = pos_obs.to(dtype=th.float32, non_blocking=True)
+            pos_obs = observations["position"].to(
+                device, dtype=th.float32, non_blocking=True
+            )
         else:
-            # Use cuda if available for consistency with visual features
-            if th.cuda.is_available():
-                pos_obs = th.as_tensor(
-                    observations["position"], dtype=th.float32, device="cuda"
-                )
-            else:
-                pos_obs = th.as_tensor(observations["position"], dtype=th.float32)
+            pos_obs = th.as_tensor(
+                observations["position"], dtype=th.float32, device=device
+            )
 
         # Add batch dimension if needed
         if pos_obs.dim() == 1:
-            pos_obs = pos_obs.unsqueeze(0)  # (2,) -> (1,2)
+            pos_obs = pos_obs.unsqueeze(0)  # (3,) -> (1,3)
 
         pos_features = self.pos_net(pos_obs)
 
-        # Process action history features
-        # action_history_obs = th.as_tensor(observations["action_history"]).float()
+        # Process target layer features
+        if isinstance(observations["persistent_target_layer"], th.Tensor):
+            persistent_target_layer_obs = observations["persistent_target_layer"].to(
+                device, dtype=th.float32, non_blocking=True
+            )
+        else:
+            persistent_target_layer_obs = th.as_tensor(
+                observations["persistent_target_layer"], dtype=th.float32, device=device
+            )
+
+        if isinstance(observations["expirable_target_layer"], th.Tensor):
+            expirable_target_layer_obs = observations["expirable_target_layer"].to(
+                device, dtype=th.float32, non_blocking=True
+            )
+        else:
+            expirable_target_layer_obs = th.as_tensor(
+                observations["expirable_target_layer"], dtype=th.float32, device=device
+            )
 
         # Add batch dimension if needed
-        # if action_history_obs.dim() == 1:
-        #     action_history_obs = action_history_obs.unsqueeze(0)
-        # action_history_features = self.action_history_net(action_history_obs)
+        if persistent_target_layer_obs.dim() == 1:
+            persistent_target_layer_obs = persistent_target_layer_obs.unsqueeze(0)
+        persistent_layer_features = self.persistent_target_layer_net(
+            persistent_target_layer_obs
+        )
 
-        # Combine features
-        # combined = th.cat([visual_features, pos_features], dim=1)
+        if expirable_target_layer_obs.dim() == 1:
+            expirable_target_layer_obs = expirable_target_layer_obs.unsqueeze(0)
+        expirable_layer_features = self.expirable_target_layer_net(
+            expirable_target_layer_obs
+        )
 
-        return self.combined(th.cat([visual_features, pos_features], dim=1))
+        # Combine all features
+        return self.combined(
+            th.cat(
+                [
+                    visual_features,
+                    pos_features,
+                    persistent_layer_features,
+                    expirable_layer_features,
+                ],
+                dim=1,
+            )
+        )
 
 
 class CustomVecTranspose(VecTransposeImage):
@@ -1002,9 +1433,12 @@ class CustomVecTranspose(VecTransposeImage):
                 "position": venv.observation_space[
                     "position"
                 ],  # Keep position space as is
-                # "action_history": spaces.Box(
-                #     low=0, high=255, shape=(10,), dtype=np.uint8
-                # ),
+                "persistent_target_layer": venv.observation_space[
+                    "persistent_target_layer"
+                ],
+                "expirable_target_layer": venv.observation_space[
+                    "expirable_target_layer"
+                ],
             }
         )
 
@@ -1017,13 +1451,20 @@ class CustomVecTranspose(VecTransposeImage):
         if isinstance(obs, dict):
             # For single observations (e.g., during evaluation)
             visual_obs = obs["visual"]  # Shape: (H, W, C)
-            position = obs["position"]  # Shape: (2,)
+            position = obs["position"]  # Shape: (3,) - x, y, layer
+            persistent_target_layer = obs["persistent_target_layer"]  # Shape: (1,)
+            expirable_target_layer = obs["expirable_target_layer"]  # Shape: (1,)
         else:
             # For vectorized observations (e.g., from DummyVecEnv)
             # This is the most common case during training
             visual_obs = obs[0]["visual"]  # Shape: (H, W, C) or (1, H, W, C)
-            position = obs[0]["position"]  # Shape: (2,) or (1, 2)
-            # action_history = obs[0]["action_history"]  # Shape: (10,) or (1, 10)
+            position = obs[0]["position"]  # Shape: (3,) or (1, 3)
+            persistent_target_layer = obs[0][
+                "persistent_target_layer"
+            ]  # Shape: (1,) or (1, 1)
+            expirable_target_layer = obs[0][
+                "expirable_target_layer"
+            ]  # Shape: (1,) or (1, 1)
 
         # Single fast check for both visual and position to remove batch dim
         # Remove any extra batch dimension from DummyVecEnv if present
@@ -1031,7 +1472,27 @@ class CustomVecTranspose(VecTransposeImage):
             visual_obs = visual_obs[0]  # Convert (1, H, W, C) to (H, W, C)
 
         if isinstance(position, np.ndarray) and len(position.shape) == 2:
-            position = position[0]  # Convert (1, 2) to (2,)
+            position = position[0]  # Convert (1, 3) to (3,)
+
+        if isinstance(persistent_target_layer, np.ndarray):
+            if len(persistent_target_layer.shape) > 1:
+                persistent_target_layer = persistent_target_layer[
+                    0
+                ]  # Convert (1, 1) to (1,)
+            if len(persistent_target_layer.shape) == 0:
+                persistent_target_layer = persistent_target_layer.reshape(
+                    1
+                )  # Ensure shape is (1,)
+
+        if isinstance(expirable_target_layer, np.ndarray):
+            if len(expirable_target_layer.shape) > 1:
+                expirable_target_layer = expirable_target_layer[
+                    0
+                ]  # Convert (1, 1) to (1,)
+            if len(expirable_target_layer.shape) == 0:
+                expirable_target_layer = expirable_target_layer.reshape(
+                    1
+                )  # Ensure shape is (1,)
 
         # Convert from HWC to CHW format - only once and only if needed
         # Check if already in CHW format to avoid unnecessary transpose
@@ -1040,24 +1501,8 @@ class CustomVecTranspose(VecTransposeImage):
             and len(visual_obs.shape) == 3
             and visual_obs.shape[2] <= 12
         ):
-            # Standard case - needs transpose
-
-            h, w, c = visual_obs.shape
-
-            # Create or resize transpose buffer if needed
-            if not hasattr(
-                self, "_transpose_buffer"
-            ) or self._transpose_buffer.shape != (c, h, w):
-                # First usage or shape changed, create new buffer with exact shape needed
-                self._transpose_buffer = np.empty((c, h, w), dtype=visual_obs.dtype)
-
-            # Manual optimized transpose to reuse existing buffer (no new allocation)
-            # it should faster than np.transpose which would create a new array
-            for i in range(c):
-                # Direct slice assignment is more efficient than np.copyto
-                self._transpose_buffer[i] = visual_obs[:, :, i]
-
-            visual_result = self._transpose_buffer
+            # Use numpy's optimized transpose instead of manual loop
+            visual_result = np.ascontiguousarray(np.transpose(visual_obs, (2, 0, 1)))
         else:
             # Already in the right format or special case, no need to transpose
             visual_result = visual_obs
@@ -1065,7 +1510,8 @@ class CustomVecTranspose(VecTransposeImage):
         return {
             "visual": visual_result,
             "position": position,
-            # "action_history": action_history,
+            "persistent_target_layer": persistent_target_layer,
+            "expirable_target_layer": expirable_target_layer,
         }
 
 
@@ -1139,6 +1585,7 @@ def continue_training(model_path, additional_timesteps=100000, checkpoint_freq=1
 # Create environment pipeline
 def make_env():
     env = VisualSimulationEnv()
+    env = TimeLimit(env, max_episode_steps=200)
     env = Monitor(env)
     return env
 
@@ -1210,16 +1657,13 @@ def create_eval_env_with_frame_stacking(n_stack=4, render_mode="human", debug=Fa
 class MemoryManagementCallback(BaseCallback):
     def __init__(self, verbose=0):
         super().__init__(verbose)
+        self.last_memory_check = 0
 
     def _on_step(self) -> bool:
-        # Run garbage collection when memory is low or every 50K steps
-        import psutil
-
-        memory_percent = psutil.virtual_memory().percent
-        if memory_percent > 95 or self.num_timesteps % 50000 == 0:
+        if self.num_timesteps - self.last_memory_check > 50000:
+            self.last_memory_check = self.num_timesteps
             gc.collect()
             if th.cuda.is_available():
-                # Clear CUDA cache if using GPU
                 th.cuda.empty_cache()
 
             # Log memory usage if verbose
@@ -1227,7 +1671,12 @@ class MemoryManagementCallback(BaseCallback):
                 import psutil
 
                 memory_usage = psutil.Process().memory_info().rss / (1024 * 1024)
-                print(f"Step {self.num_timesteps}: Memory usage: {memory_usage:.2f} MB")
+                gpu_memory = ""
+                if th.cuda.is_available():
+                    gpu_memory = f", GPU memory: {th.cuda.memory_allocated() / 1024 / 1024:.1f}MB"
+                print(
+                    f"Step {self.num_timesteps}: Memory usage: {memory_usage:.2f}MB{gpu_memory}"
+                )
 
         return True
 
@@ -1235,9 +1684,9 @@ class MemoryManagementCallback(BaseCallback):
 # Only run training code when script is executed directly (not imported)
 if __name__ == "__main__":
     # Training parameters
-    total_timesteps = 1000000
-    check_freq = 50000  # Save checkpoint every 50k steps
-    MODEL_TAG = "PPO_Res200_CoordConv_FrameStack4_KL_0.1_Continuous"
+    total_timesteps = 5000000
+    check_freq = 100000  # Save checkpoint every 50k steps
+    MODEL_TAG = "PPO_expirable_target_nn_Continuous_v3"
 
     # Create environment with frame stacking
     n_stack = 4  # Stack 4 frames
@@ -1252,9 +1701,11 @@ if __name__ == "__main__":
             input_channels=input_channels,
             # Downscale the visual input to this size (height, width)
             # resize_to=(84, 84)
+            n_stack=n_stack,
         ),
         # Use a larger network to process the stacked frames
         net_arch=[256, 128, 64],
+        # net_arch=[256, 256],
     )
 
     # Initialize model
@@ -1263,13 +1714,14 @@ if __name__ == "__main__":
         env,
         verbose=1,
         policy_kwargs=policy_kwargs,
-        learning_rate=3e-4,
-        n_steps=2048,
+        learning_rate=3e-5,
+        n_steps=4096,
         batch_size=512,
         ent_coef=0.001,
         tensorboard_log=os.path.join("Training", "Logs"),
         device=device,
-        target_kl=0.1,
+        target_kl=0.05,
+        normalize_advantage=True,
     )
 
     # Configure garbage collection
@@ -1356,7 +1808,7 @@ if __name__ == "__main__":
     if th.cuda.is_available():
         th.cuda.empty_cache()
 
-    # Save the final model
+    # Save the fdatetimeel
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     model.save(f"ppo_visual_attention_full_{timestamp}")
     print(f"Final model saved as ppo_visual_attention_full_{timestamp}")
